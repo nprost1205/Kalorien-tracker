@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1a1e1b" media="(prefers-color-scheme: dark)">
+  <title>Kalorien-Tracker</title>
+  <link rel="icon" href="icons/icon-192.png" type="image/png">
+  <script>
+    // Manifest (installierbare App) nur über http(s); unter file:// meldet Chrome sonst einen CORS-Fehler
+    if (location.protocol !== 'file:') {
+      const manifest = document.createElement('link');
+      manifest.rel = 'manifest';
+      manifest.href = 'manifest.webmanifest';
+      document.head.appendChild(manifest);
+    }
+  </script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Kalorien-Tracker</h1>
+    <nav class="tabs" role="tablist">
+      <button type="button" class="tab" role="tab" data-view="day">Tag</button>
+      <button type="button" class="tab" role="tab" data-view="history">Verlauf</button>
+      <button type="button" class="tab" role="tab" data-view="recipes">Rezepte</button>
+      <button type="button" class="tab" role="tab" data-view="goals">Ziele</button>
+      <button type="button" class="tab" role="tab" data-view="data">Daten</button>
+    </nav>
+  </header>
+
+  <div id="storageBanner" class="banner" hidden></div>
+
+  <main>
+    <!-- Tag -->
+    <section id="view-day" class="view">
+      <div class="datebar card">
+        <button type="button" id="prevDay" class="icon-btn" aria-label="Vorheriger Tag">◀</button>
+        <div class="date-center">
+          <div id="dateLabel" class="date-label"></div>
+          <button type="button" id="todayBtn" class="link-btn">Zu heute springen</button>
+        </div>
+        <button type="button" id="nextDay" class="icon-btn" aria-label="Nächster Tag">▶</button>
+      </div>
+      <div id="summary" class="card summary"></div>
+      <div id="meals" class="meals"></div>
+      <div id="sport" class="card meal"></div>
+    </section>
+
+    <!-- Verlauf -->
+    <section id="view-history" class="view" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>Kalorien pro Tag</h2>
+          <div class="seg" id="rangeSeg">
+            <button type="button" data-range="7">7 Tage</button>
+            <button type="button" data-range="30">30 Tage</button>
+          </div>
+        </div>
+        <div id="chart" class="chart"></div>
+        <div class="legend">
+          <span><i class="sw sw-ok"></i>im Ziel</span>
+          <span><i class="sw sw-over"></i>über Ziel</span>
+          <span><i class="sw sw-goal"></i><span id="legendGoal">Ziel</span></span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Durchschnitt</h2>
+        <div id="averages"></div>
+      </div>
+    </section>
+
+    <!-- Rezepte -->
+    <section id="view-recipes" class="view" hidden>
+      <div id="recipeList" class="card">
+        <div class="card-head">
+          <h2>Rezepte</h2>
+          <button type="button" id="newRecipeBtn" class="btn primary small">+ Neues Rezept</button>
+        </div>
+        <div id="recipeItems"></div>
+      </div>
+
+      <form id="recipeEditor" class="card" novalidate hidden>
+        <h2 id="recipeEditorTitle">Neues Rezept</h2>
+        <div id="recipeNote" class="note" hidden></div>
+        <div class="form-grid">
+          <label class="field wide">Name <input type="text" id="recipeName" autocomplete="off"></label>
+          <label class="field">Portionen <input type="number" id="recipeServings" min="0" step="any" inputmode="decimal"></label>
+          <label class="field">Gewicht fertig (g) <input type="number" id="recipeWeight" min="0" step="any" inputmode="decimal"></label>
+        </div>
+        <p class="hint">„Gewicht fertig“ ist optional. Leer zählt die Summe der Zutaten. Beim Kochen verdunstet oft Wasser. Wenn du das fertige Gericht wiegst, stimmen Einträge nach Gramm genauer. Die Werte pro Portion bleiben gleich.</p>
+        <div class="card-head">
+          <h3>Zutaten</h3>
+          <button type="button" id="addIngredientBtn" class="btn small">+ Zutat hinzufügen</button>
+        </div>
+        <ul id="recipeIngredients" class="entries"></ul>
+        <div id="recipeNutrition" class="table-wrap"></div>
+        <label class="field">Zubereitung (optional, ein Schritt pro Zeile)
+          <textarea id="recipeInstructions" rows="5"></textarea>
+        </label>
+        <p id="recipeMsg" class="msg error" hidden></p>
+        <div class="form-actions">
+          <button type="submit" class="btn primary">Rezept speichern</button>
+          <button type="button" id="cancelRecipeBtn" class="btn">Abbrechen</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Ziele -->
+    <section id="view-goals" class="view" hidden>
+      <form id="goalsForm" class="card" novalidate>
+        <h2>Tagesziele</h2>
+        <p class="muted">Kalorien, Kohlenhydrate und Fett gelten als Obergrenze. Eiweiß und Ballaststoffe gelten als Mindestmenge.</p>
+        <div id="goalsFields" class="form-grid"></div>
+        <div class="form-actions">
+          <button type="submit" class="btn primary">Speichern</button>
+          <span id="goalsMsg" class="msg" hidden></span>
+        </div>
+      </form>
+    </section>
+
+    <!-- Daten -->
+    <section id="view-data" class="view" hidden>
+      <div class="card">
+        <h2>Backup</h2>
+        <p class="muted">Deine Daten liegen nur in diesem Browser auf deinem PC. Wenn du die Browserdaten löschst, ist alles weg. Exportiere deshalb regelmäßig ein Backup.</p>
+        <p id="dataStats"></p>
+        <div class="form-actions">
+          <button type="button" id="exportBtn" class="btn primary">Backup exportieren</button>
+          <button type="button" id="shareBtn" class="btn" hidden>Backup teilen …</button>
+          <button type="button" id="importBtn" class="btn">Backup importieren …</button>
+          <!-- kein accept-Filter: Android-Dateiauswahl graut .json aus Drive/Mail sonst oft aus -->
+          <input type="file" id="importFile" hidden>
+        </div>
+        <p id="dataMsg" class="msg" hidden></p>
+      </div>
+      <div class="card">
+        <h2>Gespeicherte Produkte</h2>
+        <p class="muted">Diese Produkte erscheinen unter „Zuletzt verwendet“. Wenn du hier eines entfernst, bleiben bestehende Tagebucheinträge und Rezepte unverändert.</p>
+        <div id="foodList"></div>
+      </div>
+      <div class="card">
+        <h2>Alle Daten löschen</h2>
+        <button type="button" id="resetBtn" class="btn danger">Alle Daten löschen</button>
+      </div>
+    </section>
+  </main>
+
+  <!-- Hinzufügen-Dialog -->
+  <dialog id="addDialog">
+    <div class="dlg">
+      <div class="dlg-head">
+        <h2 id="dlgTitle">Hinzufügen</h2>
+        <button type="button" class="icon-btn" id="dlgClose" aria-label="Schließen">✕</button>
+      </div>
+
+      <div id="stepPick">
+        <div class="seg full" id="pickTabs">
+          <button type="button" data-pick="recent">Zuletzt</button>
+          <button type="button" data-pick="recipes">Rezepte</button>
+          <button type="button" data-pick="online">Online-Suche</button>
+          <button type="button" data-pick="manual">Manuell</button>
+        </div>
+
+        <div data-pane="recent">
+          <input type="search" id="recentFilter" placeholder="Filtern …" autocomplete="off">
+          <ul id="recentList" class="results"></ul>
+        </div>
+
+        <div data-pane="recipes" hidden>
+          <input type="search" id="recipeFilter" placeholder="Rezepte filtern …" autocomplete="off">
+          <ul id="recipePickList" class="results"></ul>
+        </div>
+
+        <div data-pane="online" hidden>
+          <form id="searchForm" class="search-row">
+            <input type="search" id="searchInput" placeholder="Produktname oder Barcode-Nummer" autocomplete="off">
+            <button type="submit" id="searchBtn" class="btn primary">Suchen</button>
+          </form>
+          <p class="hint">Die Daten stammen von Open Food Facts, dafür brauchst du Internet.</p>
+          <p id="searchStatus" class="status"></p>
+          <ul id="searchResults" class="results"></ul>
+        </div>
+
+        <div data-pane="manual" hidden>
+          <form id="manualForm" novalidate>
+            <label class="field">Name <input type="text" id="manName" autocomplete="off"></label>
+            <p class="hint">Nährwerte pro 100 g (Kalorien sind Pflicht)</p>
+            <div id="manualFields" class="form-grid"></div>
+            <p id="manualMsg" class="msg error" hidden></p>
+            <button type="submit" class="btn primary">Weiter</button>
+          </form>
+        </div>
+      </div>
+
+      <div id="stepAmount" hidden>
+        <button type="button" class="link-btn" id="backBtn">← Zurück</button>
+        <h3 id="selName" class="sel-name"></h3>
+        <p id="selBrand" class="muted"></p>
+        <div class="amount-row">
+          <label class="field">Menge (g)
+            <input type="number" id="gramsInput" min="0" step="any" inputmode="decimal">
+          </label>
+          <label class="field" id="portionsField">Portionen
+            <input type="number" id="portionsInput" min="0" step="any" inputmode="decimal">
+          </label>
+          <label class="field" id="mealField">Mahlzeit
+            <select id="mealSelect"></select>
+          </label>
+        </div>
+        <p id="servingHint" class="hint"></p>
+        <p id="amountMsg" class="msg error" hidden></p>
+        <div id="preview"></div>
+        <button type="button" id="confirmAdd" class="btn primary full">Hinzufügen</button>
+      </div>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
