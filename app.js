@@ -1204,8 +1204,8 @@ function renderRecipes() {
   recipeFilterTags = recipeFilterTags.filter(key => usedTags.some(t => t.key === key));
   const anyDisliked = all.some(r => recipeDislikes(r).length);
   if (!anyDisliked) hideDisliked = false;
-  $('#recipeFilter').hidden = !usedTags.length && !anyDisliked;
-  $('#recipeFilter').innerHTML = usedTags.map(t => `
+  $('#recipeTagFilter').hidden = !usedTags.length && !anyDisliked;
+  $('#recipeTagFilter').innerHTML = usedTags.map(t => `
     <button type="button" class="tag-chip" data-filter-tag="${t.key}" aria-pressed="${recipeFilterTags.includes(t.key)}">${t.icon} ${t.label}</button>`).join('')
     + (anyDisliked ? `
     <button type="button" class="tag-chip" data-filter-dislikes aria-pressed="${hideDisliked}">👎 ausblenden</button>` : '');
@@ -1287,7 +1287,8 @@ function recipeRow(r) {
         </details>
       </div>
       <div class="recipe-actions">
-        <button type="button" class="btn small primary" data-recipe-log>Eintragen</button>
+        <button type="button" class="btn small primary" data-recipe-cook>👩‍🍳 Kochen</button>
+        <button type="button" class="btn small" data-recipe-log>Eintragen</button>
         <button type="button" class="btn small" data-recipe-shop>🛒 Einkaufen</button>
         <button type="button" class="btn small" data-recipe-edit>Bearbeiten</button>
         <button type="button" class="icon-btn del" data-recipe-del aria-label="Rezept löschen" title="Löschen">✕</button>
@@ -1534,7 +1535,7 @@ function isDraftDirty() {
 function bindRecipeEvents() {
   $('#newRecipeBtn').addEventListener('click', () => startRecipeEdit(null));
 
-  $('#recipeFilter').addEventListener('click', ev => {
+  $('#recipeTagFilter').addEventListener('click', ev => {
     if (ev.target.closest('[data-filter-dislikes]')) {
       hideDisliked = !hideDisliked;
       renderRecipes();
@@ -1561,7 +1562,9 @@ function bindRecipeEvents() {
     const li = ev.target.closest('.recipe-item');
     const recipe = li && state.recipes[li.dataset.id];
     if (!recipe) return;
-    if (ev.target.closest('[data-recipe-log]')) {
+    if (ev.target.closest('[data-recipe-cook]')) {
+      openCookView(recipe);
+    } else if (ev.target.closest('[data-recipe-log]')) {
       openDialog({ target: 'diary', title: `Eintragen: ${formatDateLabel(currentDate)}`, food: recipeAsFood(recipe) });
     } else if (ev.target.closest('[data-recipe-shop]')) {
       shopRecipeId = shopRecipeId === recipe.id ? null : recipe.id;
@@ -2595,6 +2598,241 @@ function bindAiEvents() {
 }
 
 // =====================================================================
+// Kochansicht
+// =====================================================================
+
+const cookDialog = $('#cookDialog');
+// Zustand bleibt erhalten, wenn dasselbe Rezept erneut geöffnet wird (z. B. nach versehentlichem Schließen)
+let cook = null; // { recipeId, portions, checked: Set<Zutat-Index>, done: Set<Schritt-Index> }
+let cookTimers = []; // { id, label, endAt, finished }
+let cookTimerInterval = null;
+let wakeLock = null;
+let audioCtx = null;
+
+/** Zeitangaben in einem Schritt („10 Minuten“, „2–3 Min.“, „1 Stunde“) → Timer-Vorschläge. Bei Spannen gilt der höhere Wert. */
+function stepTimers(step) {
+  const timers = [];
+  const pattern = /(\d+(?:[.,]\d+)?)(?:\s*(?:-|–|bis)\s*(\d+(?:[.,]\d+)?))?\s*(stunden?|std\.?|minuten?|min\.?|sekunden?|sek\.?)(?![a-zäöüß])/gi;
+  for (const m of step.matchAll(pattern)) {
+    const value = toNum(m[2] ?? m[1]);
+    const unit = m[3].toLowerCase();
+    const factor = unit.startsWith('st') ? 3600 : unit.startsWith('m') ? 60 : 1;
+    const seconds = Math.round(value * factor);
+    if (!(seconds > 0) || seconds > 24 * 3600 || timers.some(t => t.seconds === seconds)) continue;
+    const label = factor === 3600 ? `${fmt(value, 1)} Std.` : factor === 60 ? `${fmt(value, 1)} Min.` : `${fmt(value)} Sek.`;
+    timers.push({ seconds, label });
+  }
+  return timers;
+}
+
+function fmtClock(totalSeconds) {
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+function openCookView(recipe) {
+  if (cook?.recipeId !== recipe.id) {
+    cook = { recipeId: recipe.id, portions: recipe.servings > 0 ? recipe.servings : 1, checked: new Set(), done: new Set() };
+  }
+  renderCook();
+  cookDialog.showModal();
+  cookDialog.scrollTop = 0;
+  $('#cookAwakeLabel').hidden = !('wakeLock' in navigator);
+  if ($('#cookAwake').checked) requestWakeLock();
+}
+
+function renderCook() {
+  const recipe = state.recipes[cook?.recipeId];
+  if (!recipe) {
+    if (cookDialog.open) cookDialog.close();
+    return;
+  }
+  const factor = cook.portions / (recipe.servings > 0 ? recipe.servings : 1);
+  const s = recipeStats(recipe);
+  const p = s.perServing;
+  $('#cookTitle').textContent = recipe.name;
+  $('#cookMeta').textContent = `Pro Portion: ${fmt(p.kcal)} kcal · E ${fmt(p.protein, 1)} g · K ${fmt(p.carbs, 1)} g · F ${fmt(p.fat, 1)} g`;
+  $('#cookPortions').textContent = `${fmt(cook.portions, 1)} ${cook.portions === 1 ? 'Portion' : 'Portionen'}`;
+  $('#cookLess').disabled = cook.portions <= 0.5;
+
+  $('#cookIngCount').textContent = recipe.ingredients.length ? `(${cook.checked.size} von ${recipe.ingredients.length} bereit)` : '';
+  $('#cookIngredients').innerHTML = recipe.ingredients.map((ing, index) => `
+    <li class="${cook.checked.has(index) ? 'done' : ''}">
+      <label>
+        <input type="checkbox" data-cook-ing="${index}" ${cook.checked.has(index) ? 'checked' : ''}>
+        <span class="cook-amount">${fmtShopGrams(ing.grams * factor)}</span>
+        <span>${esc(ing.name)}</span>
+      </label>
+    </li>`).join('');
+
+  const steps = instructionSteps(recipe.instructions);
+  const current = steps.findIndex((_, index) => !cook.done.has(index));
+  $('#cookStepCount').textContent = steps.length
+    ? (current < 0 ? '(alles erledigt 🎉)' : `(Schritt ${current + 1} von ${steps.length})`)
+    : '';
+  $('#cookSteps').innerHTML = steps.length
+    ? steps.map((step, index) => `
+      <li class="cook-step${cook.done.has(index) ? ' done' : ''}${index === current ? ' current' : ''}">
+        <button type="button" class="cook-step-text" data-cook-step="${index}" aria-pressed="${cook.done.has(index)}">${esc(step)}</button>
+        ${stepTimers(step).map(t => `
+          <button type="button" class="btn small timer-btn" data-cook-timer="${t.seconds}" data-cook-label="${esc(`Schritt ${index + 1}: ${t.label}`)}">⏱ ${esc(t.label)}</button>`).join('')}
+      </li>`).join('')
+    : '<li class="cook-empty">Für dieses Rezept ist keine Zubereitung hinterlegt. Du kannst sie unter „Bearbeiten“ eintragen.</li>';
+
+  const video = $('#cookVideo');
+  video.hidden = !recipe.sourceUrl;
+  if (recipe.sourceUrl) video.href = recipe.sourceUrl;
+  renderCookTimers();
+}
+
+// ---------- Timer ----------
+
+function renderCookTimers() {
+  const box = $('#cookTimers');
+  box.hidden = !cookTimers.length;
+  box.innerHTML = cookTimers.map(t => `
+    <div class="cook-timer${t.finished ? ' finished' : ''}" data-id="${esc(t.id)}" role="timer">
+      <span>⏱ ${esc(t.label)}</span>
+      <b data-timer-left>${t.finished ? 'Fertig!' : fmtClock(Math.max(0, Math.ceil((t.endAt - Date.now()) / 1000)))}</b>
+      <button type="button" class="icon-btn" data-timer-stop aria-label="Timer beenden" title="Timer beenden">✕</button>
+    </div>`).join('');
+}
+
+function startCookTimer(seconds, label) {
+  unlockAudio(); // Ton ist nur nach einer Nutzeraktion erlaubt
+  cookTimers.push({ id: uid(), label, endAt: Date.now() + seconds * 1000, finished: false });
+  if (!cookTimerInterval) cookTimerInterval = setInterval(tickCookTimers, 500);
+  renderCookTimers();
+}
+
+/** Nur die Zeiten aktualisieren (kein Neuzeichnen, sonst gehen Klicks auf ✕ verloren). */
+function tickCookTimers() {
+  const now = Date.now();
+  let changed = false;
+  for (const t of cookTimers) {
+    if (!t.finished && now >= t.endAt) {
+      t.finished = true;
+      changed = true;
+      timerAlarm(t);
+    }
+  }
+  if (changed) {
+    renderCookTimers();
+  } else {
+    for (const t of cookTimers) {
+      const el = $(`#cookTimers .cook-timer[data-id="${CSS.escape(t.id)}"] [data-timer-left]`);
+      if (el && !t.finished) el.textContent = fmtClock(Math.max(0, Math.ceil((t.endAt - now) / 1000)));
+    }
+  }
+  if (!cookTimers.some(t => !t.finished)) {
+    clearInterval(cookTimerInterval);
+    cookTimerInterval = null;
+  }
+}
+
+function unlockAudio() {
+  try {
+    audioCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch { /* ohne Ton */ }
+}
+
+function timerAlarm(timer) {
+  navigator.vibrate?.([400, 200, 400, 200, 400]);
+  try {
+    if (audioCtx) {
+      for (let i = 0; i < 3; i++) {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        const start = audioCtx.currentTime + i * 0.45;
+        osc.frequency.value = 880;
+        gain.gain.setValueAtTime(0.0001, start);
+        gain.gain.exponentialRampToValueAtTime(0.4, start + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.35);
+        osc.connect(gain).connect(audioCtx.destination);
+        osc.start(start);
+        osc.stop(start + 0.4);
+      }
+    }
+  } catch { /* ohne Ton */ }
+  if (!cookDialog.open) showToast(`⏱ ${timer.label} ist fertig!`); // im geöffneten Dialog blinkt der Timer
+}
+
+// ---------- Bildschirm anlassen ----------
+
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator) || wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch { /* z. B. Energiesparmodus: dann eben nicht */ }
+}
+
+function releaseWakeLock() {
+  wakeLock?.release().catch(() => {});
+  wakeLock = null;
+}
+
+function bindCookEvents() {
+  $('#cookClose').addEventListener('click', () => cookDialog.close());
+  cookDialog.addEventListener('close', releaseWakeLock);
+  // Beim Kochen bewusst kein Schließen durch Tippen neben den Dialog
+
+  $('#cookLess').addEventListener('click', () => {
+    cook.portions = Math.max(0.5, cook.portions <= 1 ? cook.portions - 0.5 : cook.portions - 1);
+    renderCook();
+  });
+  $('#cookMore').addEventListener('click', () => {
+    cook.portions = cook.portions < 1 ? cook.portions + 0.5 : cook.portions + 1;
+    renderCook();
+  });
+
+  $('#cookIngredients').addEventListener('change', ev => {
+    const index = Number(ev.target.dataset.cookIng);
+    if (Number.isNaN(index)) return;
+    if (ev.target.checked) cook.checked.add(index);
+    else cook.checked.delete(index);
+    renderCook();
+  });
+
+  $('#cookSteps').addEventListener('click', ev => {
+    const timerBtn = ev.target.closest('[data-cook-timer]');
+    if (timerBtn) return startCookTimer(Number(timerBtn.dataset.cookTimer), timerBtn.dataset.cookLabel);
+    const stepBtn = ev.target.closest('[data-cook-step]');
+    if (!stepBtn) return;
+    const index = Number(stepBtn.dataset.cookStep);
+    if (cook.done.has(index)) cook.done.delete(index);
+    else cook.done.add(index);
+    renderCook();
+  });
+
+  $('#cookTimers').addEventListener('click', ev => {
+    if (!ev.target.closest('[data-timer-stop]')) return;
+    const id = ev.target.closest('.cook-timer').dataset.id;
+    cookTimers = cookTimers.filter(t => t.id !== id);
+    renderCookTimers();
+  });
+
+  $('#cookAwake').addEventListener('change', ev => {
+    if (ev.target.checked) requestWakeLock();
+    else releaseWakeLock();
+  });
+  document.addEventListener('visibilitychange', () => {
+    // Der Browser gibt die Sperre beim Wechsel in eine andere App frei → beim Zurückkommen neu anfordern
+    if (document.visibilityState === 'visible' && cookDialog.open && $('#cookAwake').checked) requestWakeLock();
+  });
+
+  $('#cookLog').addEventListener('click', () => {
+    const recipe = state.recipes[cook?.recipeId];
+    if (!recipe) return;
+    cookDialog.close();
+    openDialog({ target: 'diary', title: `Eintragen: ${formatDateLabel(currentDate)}`, food: recipeAsFood(recipe) });
+  });
+}
+
+// =====================================================================
 // Ansicht: Einkaufsliste
 // =====================================================================
 
@@ -3414,6 +3652,7 @@ function init() {
   bindShopPickerEvents();
   bindPantryEvents();
   bindDislikeEvents();
+  bindCookEvents();
   bindGoalEvents();
   bindDataEvents();
 

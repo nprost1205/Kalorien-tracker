@@ -161,7 +161,7 @@
             <button type="button" id="newRecipeBtn" class="btn primary small">+ Neues Rezept</button>
           </div>
         </div>
-        <div id="recipeFilter" class="recipe-filter" role="group" aria-label="Rezepte filtern" hidden></div>
+        <div id="recipeTagFilter" class="recipe-filter" role="group" aria-label="Rezepte filtern" hidden></div>
         <div id="recipeItems"></div>
       </div>
 
@@ -344,6 +344,45 @@
         <p id="amountMsg" class="msg error" hidden></p>
         <div id="preview"></div>
         <button type="button" id="confirmAdd" class="btn primary full">Hinzufügen</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Kochansicht -->
+  <dialog id="cookDialog" aria-labelledby="cookTitle">
+    <div class="cook">
+      <div class="cook-head">
+        <div>
+          <h2 id="cookTitle"></h2>
+          <p id="cookMeta" class="muted"></p>
+        </div>
+        <button type="button" class="icon-btn" id="cookClose" aria-label="Kochansicht schließen">✕</button>
+      </div>
+
+      <div class="cook-bar">
+        <div class="stepper" role="group" aria-label="Portionen">
+          <button type="button" class="btn small" id="cookLess" aria-label="Weniger Portionen">−</button>
+          <span id="cookPortions"></span>
+          <button type="button" class="btn small" id="cookMore" aria-label="Mehr Portionen">+</button>
+        </div>
+        <label class="check" id="cookAwakeLabel" hidden><input type="checkbox" id="cookAwake" checked> Bildschirm anlassen</label>
+      </div>
+
+      <div id="cookTimers" class="cook-timers" hidden></div>
+
+      <section class="cook-section">
+        <h3>Zutaten <span id="cookIngCount" class="muted"></span></h3>
+        <ul id="cookIngredients" class="cook-ings"></ul>
+      </section>
+
+      <section class="cook-section">
+        <h3>Zubereitung <span id="cookStepCount" class="muted"></span></h3>
+        <ol id="cookSteps" class="cook-steps"></ol>
+      </section>
+
+      <div class="form-actions cook-actions">
+        <a id="cookVideo" class="btn" target="_blank" rel="noopener noreferrer" hidden>▶ Video ansehen</a>
+        <button type="button" id="cookLog" class="btn primary">Gegessen? Eintragen</button>
       </div>
     </div>
   </dialog>
