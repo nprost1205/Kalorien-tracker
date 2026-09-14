@@ -25,6 +25,7 @@
       <button type="button" class="tab" role="tab" data-view="day">Tag</button>
       <button type="button" class="tab" role="tab" data-view="history">Verlauf</button>
       <button type="button" class="tab" role="tab" data-view="recipes">Rezepte</button>
+      <button type="button" class="tab" role="tab" data-view="shopping">Einkauf</button>
       <button type="button" class="tab" role="tab" data-view="goals">Ziele</button>
       <button type="button" class="tab" role="tab" data-view="data">Daten</button>
     </nav>
@@ -73,12 +74,105 @@
 
     <!-- Rezepte -->
     <section id="view-recipes" class="view" hidden>
+      <form id="importCard" class="card" novalidate hidden>
+        <div class="card-head">
+          <h2>Rezept aus Video-Text erstellen</h2>
+          <button type="button" id="importClose" class="icon-btn" aria-label="Schließen">✕</button>
+        </div>
+        <p class="hint">Kopiere die Beschreibung des Videos (TikTok, Instagram …) und füge sie hier ein. Die App erkennt Zutaten mit Mengen wie „200 g Mehl“ oder „2 EL Öl“ und die Zubereitungsschritte. Danach prüfst du alles im Rezept-Editor.</p>
+        <details class="howto">
+          <summary>Text lässt sich in TikTok oder Instagram nicht kopieren?</summary>
+          <ol>
+            <li>Mach einen Screenshot von der Beschreibung (oder vom Video, wenn das Rezept eingeblendet ist).</li>
+            <li>Öffne den Screenshot in Google Fotos → <b>Lens</b> → <b>Text</b> → alles markieren → <b>Kopieren</b>.</li>
+            <li>Hier einfügen. Text aus mehreren Screenshots kannst du nacheinander einfügen.</li>
+          </ol>
+          <p>Wird das Rezept im Video nur gesprochen, tippe die Zutaten am besten als Liste ab, eine Zutat pro Zeile.</p>
+        </details>
+        <label class="field">Text aus dem Video
+          <textarea id="importText" rows="9" placeholder="z. B.&#10;Protein-Pancakes&#10;Zutaten für 2 Portionen:&#10;- 2 Eier&#10;- 50 g Haferflocken&#10;- 1 Banane&#10;Zubereitung:&#10;1. Alles pürieren&#10;2. In der Pfanne ausbacken"></textarea>
+        </label>
+        <div class="form-grid">
+          <label class="field wide">Link zum Video (optional) <input type="url" id="importUrl" placeholder="https://…" autocomplete="off"></label>
+          <label class="field">Portionen <input type="number" id="importServings" min="1" step="1" placeholder="laut Text" inputmode="numeric"></label>
+        </div>
+        <p id="importMsg" class="msg error" hidden></p>
+        <div class="form-actions">
+          <button type="submit" class="btn primary">Rezept erkennen</button>
+        </div>
+      </form>
+
+      <form id="aiCard" class="card" novalidate hidden>
+        <div class="card-head">
+          <h2>Rezept mit KI erstellen</h2>
+          <button type="button" id="aiClose" class="icon-btn" aria-label="Schließen">✕</button>
+        </div>
+
+        <div id="aiSetup" class="ai-setup" hidden>
+          <p><b>Einmalige Einrichtung (ca. 2 Minuten)</b></p>
+          <ol>
+            <li><a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">Google AI Studio öffnen</a> und mit deinem Google-Konto anmelden.</li>
+            <li>Auf <b>„API-Schlüssel erstellen“</b> (englisch „Create API key“) tippen und den Schlüssel kopieren.</li>
+            <li>Schlüssel hier einfügen und auf <b>„Speichern“</b> tippen.</li>
+          </ol>
+          <div class="search-row">
+            <input type="text" id="aiKeyInput" placeholder="API-Schlüssel einfügen" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <button type="button" id="aiKeySave" class="btn primary">Speichern</button>
+          </div>
+          <p id="aiKeyMsg" class="msg" hidden></p>
+          <p class="hint">Der Schlüssel bleibt nur auf diesem Gerät und kommt nicht ins Backup. Auf dem Handy trägst du ihn einmal extra ein. Gesendet werden nur dein Wunschtext und auf Wunsch dein Restbudget, keine Einträge. Im kostenlosen Tarif darf Google diese Anfragen auswerten.</p>
+        </div>
+
+        <div id="aiMain" class="ai-main" hidden>
+          <label class="field">Was möchtest du kochen?
+            <textarea id="aiPrompt" rows="3" placeholder="z. B. schnelles Abendessen mit Reis und Gemüse"></textarea>
+          </label>
+          <div class="field">Das Rezept soll sein:
+            <div id="aiTags" class="tag-picks" role="group" aria-label="Eigenschaften des Rezepts"></div>
+          </div>
+          <p id="aiDislikeHint" class="hint" hidden></p>
+          <div class="form-grid">
+            <label class="field">Portionen <input type="number" id="aiServings" min="1" max="20" step="1" value="2" inputmode="numeric"></label>
+          </div>
+          <label class="check"><input type="checkbox" id="aiUseBudget"> <span id="aiBudgetLabel">An meinem heutigen Restbudget ausrichten</span></label>
+          <p id="aiStatus" class="status"></p>
+          <div class="form-actions">
+            <button type="submit" id="aiGenerate" class="btn primary">Rezept erstellen</button>
+            <button type="button" id="aiCancel" class="btn" hidden>Abbrechen</button>
+          </div>
+          <details id="aiSettings" class="howto">
+            <summary>KI-Einstellungen</summary>
+            <div class="ai-settings">
+              <label class="field">Modell (Google Gemini) <select id="aiModel"></select></label>
+              <div class="form-actions">
+                <button type="button" id="aiKeyRemove" class="btn small">API-Schlüssel entfernen</button>
+              </div>
+            </div>
+          </details>
+        </div>
+      </form>
+
       <div id="recipeList" class="card">
         <div class="card-head">
           <h2>Rezepte</h2>
-          <button type="button" id="newRecipeBtn" class="btn primary small">+ Neues Rezept</button>
+          <div class="head-actions">
+            <button type="button" id="aiOpenBtn" class="btn small">✨ Mit KI</button>
+            <button type="button" id="importOpenBtn" class="btn small">📋 Aus Video-Text</button>
+            <button type="button" id="newRecipeBtn" class="btn primary small">+ Neues Rezept</button>
+          </div>
         </div>
+        <div id="recipeFilter" class="recipe-filter" role="group" aria-label="Rezepte filtern" hidden></div>
         <div id="recipeItems"></div>
+      </div>
+
+      <div id="dislikeCard" class="card">
+        <h2>👎 Mag ich nicht</h2>
+        <p class="hint">Diese Zutaten lässt die KI bei neuen Rezepten weg. Rezepte, die sie enthalten, bekommen einen Hinweis und lassen sich in der Liste ausblenden. Oberbegriffe wie „Pilze“, „Fisch“ oder „Nüsse“ schließen Champignons, Lachs oder Mandeln mit ein.</p>
+        <form id="dislikeForm" class="search-row" novalidate>
+          <input type="text" id="dislikeInput" placeholder="z. B. Pilze, Koriander, Rosenkohl" autocomplete="off" enterkeyhint="done" aria-label="Zutat, die du nicht magst">
+          <button type="submit" class="btn">Hinzufügen</button>
+        </form>
+        <div id="dislikeList" class="pantry-list"></div>
       </div>
 
       <form id="recipeEditor" class="card" novalidate hidden>
@@ -89,6 +183,10 @@
           <label class="field">Portionen <input type="number" id="recipeServings" min="0" step="any" inputmode="decimal"></label>
           <label class="field">Gewicht fertig (g) <input type="number" id="recipeWeight" min="0" step="any" inputmode="decimal"></label>
         </div>
+        <div class="field">Eigenschaften
+          <div id="recipeTags" class="tag-picks" role="group" aria-label="Eigenschaften des Rezepts"></div>
+        </div>
+        <div id="recipeTagNote" class="note" hidden></div>
         <p class="hint">„Gewicht fertig“ ist optional. Leer zählt die Summe der Zutaten. Beim Kochen verdunstet oft Wasser. Wenn du das fertige Gericht wiegst, stimmen Einträge nach Gramm genauer. Die Werte pro Portion bleiben gleich.</p>
         <div class="card-head">
           <h3>Zutaten</h3>
@@ -99,12 +197,45 @@
         <label class="field">Zubereitung (optional, ein Schritt pro Zeile)
           <textarea id="recipeInstructions" rows="5"></textarea>
         </label>
+        <label class="field">Link zum Video (optional)
+          <input type="url" id="recipeUrl" placeholder="https://…" autocomplete="off">
+        </label>
         <p id="recipeMsg" class="msg error" hidden></p>
         <div class="form-actions">
           <button type="submit" class="btn primary">Rezept speichern</button>
           <button type="button" id="cancelRecipeBtn" class="btn">Abbrechen</button>
         </div>
       </form>
+    </section>
+
+    <!-- Einkauf -->
+    <section id="view-shopping" class="view" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>Einkaufsliste</h2>
+          <button type="button" id="shopShare" class="btn small" hidden>Liste teilen</button>
+        </div>
+        <form id="shopForm" class="search-row" novalidate>
+          <input type="text" id="shopInput" placeholder="z. B. Milch oder 500 g Hackfleisch" autocomplete="off" enterkeyhint="done" aria-label="Neuer Eintrag">
+          <button type="submit" class="btn primary">Hinzufügen</button>
+        </form>
+        <p class="hint">Zutaten aus Rezepten fügst du im Reiter „Rezepte“ mit „🛒 Einkaufen“ hinzu. Gleiche Zutaten werden zusammengerechnet. Mit „🏪 Markt“ legst du fest, wo du etwas kaufst, dann wird die Liste nach Märkten sortiert.</p>
+        <ul id="shopList" class="shop-list"></ul>
+        <div id="shopActions" class="form-actions" hidden>
+          <button type="button" id="shopClearDone" class="btn small">Erledigte entfernen</button>
+          <button type="button" id="shopClearAll" class="btn small">Liste leeren</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Zu Hause vorrätig</h2>
+        <p class="hint">Diese Zutaten lässt die App weg, wenn du ein Rezept auf die Einkaufsliste setzt. Dort kannst du sie bei Bedarf trotzdem anhaken, z. B. wenn der Vorrat leer ist.</p>
+        <form id="pantryForm" class="search-row" novalidate>
+          <input type="text" id="pantryInput" placeholder="z. B. Olivenöl, Reis, Nudeln" autocomplete="off" enterkeyhint="done" aria-label="Vorrätige Zutat">
+          <button type="submit" class="btn">Hinzufügen</button>
+        </form>
+        <div id="pantryList" class="pantry-list"></div>
+      </div>
     </section>
 
     <!-- Ziele -->
@@ -214,6 +345,39 @@
         <div id="preview"></div>
         <button type="button" id="confirmAdd" class="btn primary full">Hinzufügen</button>
       </div>
+    </div>
+  </dialog>
+
+  <!-- Markt für einen Einkaufslisten-Eintrag wählen -->
+  <dialog id="shopPicker">
+    <div class="dlg">
+      <div class="dlg-head">
+        <h2 id="pickerTitle">Markt wählen</h2>
+        <button type="button" class="icon-btn" id="pickerClose" aria-label="Schließen">✕</button>
+      </div>
+
+      <h3>Deine Märkte</h3>
+      <p id="pickerMineEmpty" class="hint">Noch keine Märkte gespeichert. Such unten Märkte in deiner Nähe oder trag einen eigenen ein.</p>
+      <ul id="pickerShops" class="results"></ul>
+
+      <h3>Märkte in der Nähe</h3>
+      <form id="pickerAddressForm" class="search-row" novalidate>
+        <input type="text" id="pickerAddress" placeholder="Adresse oder Postleitzahl" autocomplete="off" enterkeyhint="search" aria-label="Adresse oder Postleitzahl">
+        <button type="submit" id="pickerAddressBtn" class="btn primary">Suchen</button>
+      </form>
+      <button type="button" id="pickerGps" class="btn small">📍 Aktuellen Standort verwenden</button>
+      <p class="hint">Die Adresse wird gespeichert, der aktuelle Standort nur für diese Suche genutzt. Für die Suche werden Adresse bzw. Standort an OpenStreetMap geschickt.</p>
+      <p id="pickerStatus" class="status"></p>
+      <label class="field" id="pickerTypeField" hidden>Art
+        <select id="pickerType"></select>
+      </label>
+      <ul id="pickerNearby" class="results"></ul>
+
+      <h3>Anderer Markt</h3>
+      <form id="pickerOwnForm" class="search-row" novalidate>
+        <input type="text" id="pickerOwnName" placeholder="z. B. Wochenmarkt" autocomplete="off" aria-label="Name des Markts">
+        <button type="submit" class="btn">Hinzufügen</button>
+      </form>
     </div>
   </dialog>
 

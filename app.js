@@ -25,6 +25,19 @@ const MEALS = [
 
 const DEFAULT_GOALS = { kcal: 2000, protein: 100, carbs: 250, fat: 70, fiber: 30 };
 
+// Eigenschaften von Rezepten. Grenzwerte gelten pro Portion und werden im Editor anhand der Nährwerte geprüft.
+const LOWCAL_MAX_KCAL = 500;
+const HIGHPROTEIN_MIN_G = 30;
+const HIGHCARB_MIN_G = 60;
+const RECIPE_TAGS = [
+  { key: 'vegan', label: 'vegan', icon: '🌱', prompt: 'vegan: keine tierischen Zutaten (kein Fleisch, kein Fisch, keine Eier, keine Milchprodukte, kein Honig)' },
+  { key: 'vegetarian', label: 'vegetarisch', icon: '🥕', prompt: 'vegetarisch: kein Fleisch, kein Fisch, keine Meeresfrüchte' },
+  { key: 'lowcal', label: 'kalorienarm', icon: '🪶', prompt: `kalorienarm: höchstens ${LOWCAL_MAX_KCAL} kcal pro Portion` },
+  { key: 'highcarb', label: 'kohlenhydratreich', icon: '🍝', prompt: `kohlenhydratreich: mindestens ${HIGHCARB_MIN_G} g Kohlenhydrate pro Portion, z. B. mit Nudeln, Reis, Kartoffeln, Brot oder Haferflocken als Basis` },
+  { key: 'highprotein', label: 'proteinreich', icon: '💪', prompt: `proteinreich: mindestens ${HIGHPROTEIN_MIN_G} g Eiweiß pro Portion` },
+];
+const TAG = Object.fromEntries(RECIPE_TAGS.map(t => [t.key, t]));
+
 const OFF_BASE ='https://world.openfoodfacts.org';
 const OFF_FIELDS = 'code,product_name,product_name_de,generic_name_de,brands,nutriments,serving_quantity';
 const OFF_TIMEOUT_MS = 20000; // die Textsuche von Open Food Facts ist oft langsam
@@ -55,6 +68,10 @@ function toNum(v) {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(String(v).trim().replace(',', '.'));
   return Number.isFinite(n) ? n : null;
+}
+
+function isHttpUrl(v) {
+  return /^https?:\/\/\S+$/i.test(String(v ?? '').trim());
 }
 
 function round(v, decimals = 2) {
@@ -140,6 +157,19 @@ function burnedKcal(key) {
   return (state.activities[key] || []).reduce((sum, a) => sum + a.kcal, 0);
 }
 
+const SPORT_KCAL_PER_G_CARBS = 4; // 4 kcal Sport → 1 g zusätzliche Kohlenhydrate
+
+/** Sport-Zuschlag auf die Tagesziele: alle verbrannten kcal und die passenden Kohlenhydrate. */
+function sportBonus(burned) {
+  return { kcal: burned, carbs: burned / SPORT_KCAL_PER_G_CARBS };
+}
+
+/** Tagesziele eines Tages inklusive Sport (Grundziele + Zuschlag). */
+function dayGoals(key) {
+  const bonus = sportBonus(burnedKcal(key));
+  return { ...state.goals, kcal: state.goals.kcal + bonus.kcal, carbs: state.goals.carbs + bonus.carbs };
+}
+
 /** Summen und abgeleitete Werte eines Rezepts (gesamt, pro Portion, pro 100 g). */
 function recipeStats(recipe) {
   const totals = sumEntries(recipe.ingredients);
@@ -170,7 +200,10 @@ function recipeAsFood(recipe) {
 let storageWarning = '';
 
 function defaultState() {
-  return { version: 1, goals: { ...DEFAULT_GOALS }, foods: {}, recipes: {}, diary: {}, activities: {} };
+  return {
+    version: 1, goals: { ...DEFAULT_GOALS }, foods: {}, recipes: {}, diary: {}, activities: {},
+    shopping: [], shops: [], shopAssignments: {}, shopLocation: null, pantry: [], dislikes: [],
+  };
 }
 
 function normalizePer100(p) {
@@ -233,8 +266,33 @@ function normalizeRecipe(r) {
     totalWeight: totalWeight > 0 ? totalWeight : null,
     ingredients,
     instructions: String(r.instructions ?? ''),
+    sourceUrl: isHttpUrl(r.sourceUrl) ? String(r.sourceUrl).trim() : '',
+    tags: normalizeTags(r.tags),
     updated: toNum(r.updated) || 0,
   };
+}
+
+/** Nur bekannte Eigenschaften, feste Reihenfolge; vegan schließt vegetarisch ein. */
+function normalizeTags(tags) {
+  const set = new Set(Array.isArray(tags) ? tags.map(String) : []);
+  if (set.has('vegan')) set.add('vegetarian');
+  return RECIPE_TAGS.map(t => t.key).filter(key => set.has(key));
+}
+
+function toggleTag(tags, key) {
+  const set = new Set(tags);
+  if (set.has(key)) {
+    set.delete(key);
+    if (key === 'vegetarian') set.delete('vegan'); // nicht vegetarisch → auch nicht vegan
+  } else {
+    set.add(key);
+  }
+  return normalizeTags([...set]);
+}
+
+function tagChips(selected, attr) {
+  return RECIPE_TAGS.map(t => `
+    <button type="button" class="tag-chip" data-${attr}="${t.key}" aria-pressed="${selected.includes(t.key)}">${t.icon} ${t.label}</button>`).join('');
 }
 
 function normalizeActivity(a) {
@@ -276,7 +334,64 @@ function normalizeState(s) {
     const clean = list.map(normalizeActivity).filter(Boolean);
     if (clean.length) activities[key] = clean;
   }
-  return { version: 1, goals, foods, recipes, diary, activities };
+  // fehlt in Backups vor der Einkaufsliste
+  // Märkte, gemerkte Zuordnungen und Standort: fehlen in Backups vor der Markt-Funktion
+  const shops = (Array.isArray(s.shops) ? s.shops : []).map(normalizeShop).filter(Boolean);
+  const shopIds = new Set(shops.map(shop => shop.id));
+  const shopping = (Array.isArray(s.shopping) ? s.shopping : [])
+    .map(normalizeShoppingItem)
+    .filter(Boolean)
+    .map(i => ({ ...i, shopId: shopIds.has(i.shopId) ? i.shopId : null }));
+  const shopAssignments = {};
+  for (const [key, id] of Object.entries(isObj(s.shopAssignments) ? s.shopAssignments : {})) {
+    if (shopIds.has(String(id))) shopAssignments[key] = String(id);
+  }
+  const loc = isObj(s.shopLocation) ? s.shopLocation : null;
+  const shopLocation = loc && toNum(loc.lat) !== null && toNum(loc.lon) !== null
+    ? { label: String(loc.label ?? ''), lat: toNum(loc.lat), lon: toNum(loc.lon) }
+    : null;
+  const pantry = normalizeNameList(s.pantry); // fehlt in Backups vor der Vorrats-Funktion
+  const dislikes = normalizeNameList(s.dislikes); // fehlt in Backups vor „Mag ich nicht“
+  return { version: 1, goals, foods, recipes, diary, activities, shopping, shops, shopAssignments, shopLocation, pantry, dislikes };
+}
+
+/** Liste einfacher Namen (Vorrat, „Mag ich nicht“): ohne Leereinträge und Doppelte, auch ältere reine Text-Listen. */
+function normalizeNameList(list) {
+  const out = [];
+  for (const entry of Array.isArray(list) ? list : []) {
+    const name = String((isObj(entry) ? entry.name : entry) ?? '').trim();
+    if (name && !out.some(x => x.name.toLowerCase() === name.toLowerCase())) {
+      out.push({ id: String((isObj(entry) && entry.id) || uid()), name });
+    }
+  }
+  return out;
+}
+
+function normalizeShop(shop) {
+  if (!isObj(shop)) return null;
+  const name = String(shop.name ?? '').trim();
+  if (!name) return null;
+  return {
+    id: String(shop.id || uid()),
+    name,
+    detail: String(shop.detail ?? '').trim(), // z. B. „Supermarkt · Hauptstraße 5“
+    osm: shop.osm ? String(shop.osm) : '', // OpenStreetMap-ID, damit derselbe Markt nicht doppelt gespeichert wird
+  };
+}
+
+function normalizeShoppingItem(i) {
+  if (!isObj(i)) return null;
+  const name = String(i.name ?? '').trim();
+  if (!name) return null;
+  const grams = toNum(i.grams);
+  return {
+    id: String(i.id || uid()),
+    name,
+    grams: grams > 0 ? grams : null, // null = Eintrag ohne Mengenangabe (z. B. von Hand „2 Eier“)
+    sources: Array.isArray(i.sources) ? [...new Set(i.sources.map(String).filter(Boolean))] : [],
+    checked: Boolean(i.checked),
+    shopId: i.shopId ? String(i.shopId) : null,
+  };
 }
 
 function loadState() {
@@ -399,6 +514,7 @@ const RENDERERS = {
   day: renderDay,
   history: renderHistory,
   recipes: renderRecipes,
+  shopping: renderShopping,
   goals: renderGoals,
   data: renderData,
 };
@@ -462,19 +578,20 @@ function progressRow(key, value, extraClass = '', goal = state.goals[key]) {
 
 function renderSummary(t) {
   const burned = burnedKcal(currentDate);
-  const goal = state.goals.kcal + burned;
-  const rest = goal - t.kcal;
+  const goals = dayGoals(currentDate);
+  const rest = goals.kcal - t.kcal;
   const restText = rest >= 0 ? `Noch ${fmt(rest)} kcal übrig` : `${fmt(-rest)} kcal über dem Ziel`;
   const sportText = burned
-    ? ` · <span class="sport-info">Ziel inkl. ${fmt(burned)} kcal Sport (${fmt(state.goals.kcal)} + ${fmt(burned)})</span>`
+    ? ` · <span class="sport-info">Ziel inkl. ${fmt(burned)} kcal Sport (${fmt(state.goals.kcal)} + ${fmt(burned)}), `
+      + `dazu ${fmt(sportBonus(burned).carbs)} g Kohlenhydrate</span>`
     : '';
   $('#summary').innerHTML = `
     <div>
-      ${progressRow('kcal', t.kcal, 'big', goal)}
+      ${progressRow('kcal', t.kcal, 'big', goals.kcal)}
       <div class="kcal-rest">${restText}${sportText}</div>
     </div>
     <div class="prog-grid">
-      ${['protein', 'carbs', 'fat', 'fiber'].map(k => progressRow(k, t[k])).join('')}
+      ${['protein', 'carbs', 'fat', 'fiber'].map(k => progressRow(k, t[k], '', goals[k])).join('')}
     </div>`;
 }
 
@@ -498,15 +615,23 @@ function renderMeals(entries) {
 function itemRow(e, prefix = '') {
   const c = calcNutrients(e.per100, e.grams);
   const what = prefix ? 'Zutat' : 'Eintrag';
+  const missing = e.per100.kcal === null; // nur bei Zutaten aus einem eingefügten Text möglich
   return `
-    <li class="entry" data-id="${esc(e.id)}">
+    <li class="entry${missing ? ' missing' : ''}" data-id="${esc(e.id)}">
       <div class="entry-main">
         <div class="entry-name">${esc(e.name)}${e.brand ? ` <span class="muted">· ${esc(e.brand)}</span>` : ''}</div>
-        <div class="entry-macros muted">E ${fmt(c.protein, 1)} g · K ${fmt(c.carbs, 1)} g · F ${fmt(c.fat, 1)} g</div>
+        <div class="entry-macros muted">${missing
+          ? '<span class="missing-text">Nährwerte fehlen</span>'
+          : `E ${fmt(c.protein, 1)} g · K ${fmt(c.carbs, 1)} g · F ${fmt(c.fat, 1)} g`}</div>
       </div>
       <label class="grams"><input type="number" min="0" step="any" value="${e.grams}" data-${prefix}grams aria-label="Menge in Gramm"> g</label>
-      <div class="entry-kcal">${fmt(c.kcal)} kcal</div>
+      <div class="entry-kcal">${missing
+        ? `<button type="button" class="btn small" data-${prefix}lookup>Nährwerte suchen</button>`
+        : `${fmt(c.kcal)} kcal`}</div>
       <div class="entry-actions">
+        ${prefix && !missing ? `<button type="button" class="icon-btn" data-${prefix}lookup aria-label="Nährwerte suchen" title="Nährwerte aus der Produktsuche übernehmen">🔍</button>` : ''}
+        ${prefix && draftFromAi && readLocal(AI_KEY_STORAGE)
+          ? `<button type="button" class="icon-btn" data-${prefix}ai aria-label="Zutat mit KI ersetzen oder rausnehmen" title="Mit KI ersetzen oder rausnehmen">✨</button>` : ''}
         ${prefix ? `<button type="button" class="icon-btn" data-${prefix}edit aria-label="Zutat bearbeiten" title="Name und Nährwerte bearbeiten">✎</button>` : ''}
         <button type="button" class="icon-btn del" data-${prefix}del aria-label="${what} entfernen" title="Entfernen">✕</button>
       </div>
@@ -532,7 +657,7 @@ function renderSport() {
             <button type="button" class="icon-btn del" data-sport-del aria-label="Aktivität entfernen" title="Entfernen">✕</button>
           </div>
         </li>`).join('')}</ul>`
-      : '<p class="hint">Hier eingetragene Kalorien erhöhen dein Kalorienziel für diesen Tag.</p>'}
+      : `<p class="hint">Hier eingetragene Kalorien erhöhen dein Kalorienziel für diesen Tag. Pro ${SPORT_KCAL_PER_G_CARBS} kcal kommt außerdem 1 g Kohlenhydrate zu deinem Ziel dazu.</p>`}
     <form class="sport-form" novalidate>
       <input type="text" name="name" list="sportNames" placeholder="Aktivität, z. B. Joggen 30 min" aria-label="Aktivität" autocomplete="off">
       <input type="number" name="kcal" min="1" step="1" placeholder="kcal" aria-label="Verbrannte Kalorien" inputmode="numeric">
@@ -568,7 +693,7 @@ function bindSportEvents() {
     (state.activities[currentDate] ||= []).push({ id: uid(), name, kcal: Math.round(kcal) });
     saveState();
     renderDay();
-    showToast(`${name}: ${fmt(kcal)} kcal eingetragen, dein Ziel steigt entsprechend`);
+    showToast(`${name}: ${fmt(kcal)} kcal eingetragen, dein Ziel steigt um ${fmt(kcal)} kcal und ${fmt(sportBonus(kcal).carbs)} g Kohlenhydrate`);
   });
 
   // Bekannte Aktivität gewählt → zuletzt verwendete kcal vorschlagen
@@ -647,32 +772,58 @@ function bindDayEvents() {
 // =====================================================================
 
 const dialog = $('#addDialog');
-let dialogTarget = 'diary'; // 'diary' = ins Tagebuch, 'recipe' = Zutat für den Rezept-Entwurf
+// 'diary' = ins Tagebuch, 'recipe' = neue Zutat für den Rezept-Entwurf,
+// 'ingredient' = Nährwerte einer vorhandenen Entwurfs-Zutat ersetzen (lookupIngredientId)
+let dialogTarget = 'diary';
+let lookupIngredientId = null;
 let dialogMeal = 'fruehstueck';
 let selectedFood = null;
 let searchResults = [];
 let searchSeq = 0;
 
-/** Öffnet den Dialog. Mit `food` geht es direkt zur Mengeneingabe (z. B. „Rezept eintragen“). */
-function openDialog({ target, title, meal = guessMeal(), food = null }) {
+/**
+ * Öffnet den Dialog. Mit `food` geht es direkt zur Mengeneingabe (z. B. „Rezept eintragen“),
+ * mit `query` sind Filter, Online-Suche und manueller Name vorausgefüllt (Nährwerte für eine Zutat suchen).
+ */
+function openDialog({ target, title, meal = guessMeal(), food = null, query = '' }) {
   dialogTarget = target;
   dialogMeal = meal;
   selectedFood = null;
   $('#dlgTitle').textContent = title;
   $('#stepPick').hidden = false;
   $('#stepAmount').hidden = true;
-  $('#recentFilter').value = '';
+  $('#recentFilter').value = query;
   $('#recipeFilter').value = '';
   $('#manualForm').reset();
+  $('#manName').value = query;
+  if (query) $('#searchInput').value = query;
   setMsg($('#manualMsg'), '');
-  $('#pickTabs [data-pick="recipes"]').hidden = target === 'recipe'; // keine Rezepte in Rezepten
-  $('#mealField').hidden = target === 'recipe';
-  $('#confirmAdd').textContent = target === 'recipe' ? 'Zum Rezept hinzufügen' : 'Hinzufügen';
+  const forRecipe = target !== 'diary';
+  $('#pickTabs [data-pick="recipes"]').hidden = forRecipe; // keine Rezepte in Rezepten
+  $('#mealField').hidden = forRecipe;
+  $('#confirmAdd').textContent = { diary: 'Hinzufügen', recipe: 'Zum Rezept hinzufügen', ingredient: 'Nährwerte übernehmen' }[target];
   renderRecent();
   renderRecipePick();
   dialog.showModal();
-  setPickTab(food ? 'recipes' : Object.keys(state.foods).length ? 'recent' : 'online');
-  if (food) selectFood(food);
+  if (food) {
+    setPickTab('recipes');
+    selectFood(food);
+  } else if (query) {
+    // Passendes gespeichertes Produkt zuerst anbieten, sonst gleich online suchen
+    if ($('#recentList [data-food]')) {
+      setPickTab('recent');
+    } else {
+      setPickTab('online');
+      runSearch(query);
+    }
+  } else {
+    setPickTab(Object.keys(state.foods).length ? 'recent' : 'online');
+  }
+}
+
+function openIngredientLookup(ingredient) {
+  lookupIngredientId = ingredient.id;
+  openDialog({ target: 'ingredient', title: `Nährwerte für „${ingredient.name}“`, query: ingredient.name });
 }
 
 function openAdd(meal) {
@@ -770,7 +921,8 @@ function selectFood(food) {
   $('#selBrand').textContent = food.brand || '';
   $('#portionsField').hidden = !food.servingG;
   $('#servingHint').textContent = food.servingG ? `1 Portion = ${fmt(food.servingG, 1)} g` : '';
-  $('#gramsInput').value = food.servingG || 100;
+  const lookupTarget = dialogTarget === 'ingredient' && recipeDraft?.ingredients.find(i => i.id === lookupIngredientId);
+  $('#gramsInput').value = lookupTarget ? lookupTarget.grams : food.servingG || 100; // Menge aus dem Rezept beibehalten
   syncPortions();
   $('#mealSelect').value = dialogMeal;
   setMsg($('#amountMsg'), '');
@@ -817,6 +969,18 @@ function confirmAdd() {
     state.foods[f.id] = {
       id: f.id, name: f.name, brand: f.brand, code: f.code, per100: { ...f.per100 }, servingG: f.servingG, lastUsed: Date.now(),
     };
+  }
+
+  if (dialogTarget === 'ingredient') {
+    const ingredient = recipeDraft?.ingredients.find(i => i.id === lookupIngredientId);
+    if (ingredient) {
+      Object.assign(ingredient, { name: f.name, brand: f.brand, code: f.code, grams, per100: { ...f.per100 } });
+      draftImport?.estimated.delete(ingredient.id); // Menge wurde gerade bestätigt
+    }
+    saveState(); // sichert nur das gemerkte Produkt
+    dialog.close();
+    renderDraft();
+    return;
   }
 
   if (dialogTarget === 'recipe') {
@@ -977,14 +1141,19 @@ function renderHistory() {
   const avg = zeroTotals();
   for (const d of logged) for (const n of NUTRIENTS) avg[n.key] += d.totals[n.key] / logged.length;
   const avgBurned = logged.reduce((sum, d) => sum + d.burned, 0) / logged.length;
+  const avgGoals = zeroTotals();
+  for (const d of logged) {
+    const goals = dayGoals(d.key);
+    for (const n of NUTRIENTS) avgGoals[n.key] += goals[n.key] / logged.length;
+  }
   $('#averages').innerHTML = `
     <p class="muted">Durchschnitt der ${logged.length} von ${days.length} Tagen, an denen du etwas eingetragen hast.${
-      avgBurned ? ` An diesen Tagen hast du im Schnitt ${fmt(avgBurned)} kcal beim Sport verbrannt, das ist im Kalorienziel enthalten.` : ''}</p>
+      avgBurned ? ` An diesen Tagen hast du im Schnitt ${fmt(avgBurned)} kcal beim Sport verbrannt, das ist im Kalorien- und Kohlenhydratziel enthalten.` : ''}</p>
     <table class="nut-table">
       <thead><tr><th>Nährstoff</th><th>Ø pro Tag</th><th>Ziel</th><th>Erreicht</th></tr></thead>
       <tbody>
         ${NUTRIENTS.map(n => {
-          const goal = n.key === 'kcal' ? state.goals.kcal + avgBurned : state.goals[n.key];
+          const goal = avgGoals[n.key];
           const pct = goal > 0 ? (avg[n.key] / goal) * 100 : 0;
           const over = n.kind === 'max' && avg[n.key] > goal;
           return `
@@ -1004,28 +1173,113 @@ function renderHistory() {
 // =====================================================================
 
 let recipeDraft = null; // Arbeitskopie des Rezepts im Editor; null = Liste anzeigen
+let recipeFilterTags = []; // gewählte Eigenschaften im Filter der Rezeptliste (nur für diese Sitzung)
+let hideDisliked = false; // Rezepte mit „Mag ich nicht“-Zutaten ausblenden (nur für diese Sitzung)
+let shopRecipeId = null; // Rezept, bei dem gerade „🛒 Einkaufen“ aufgeklappt ist
+let shopPortions = null; // Portionen im aufgeklappten Formular (bleiben beim Neuzeichnen erhalten)
+let shopChecks = new Map(); // Zutat-Index → vom Nutzer gesetztes Häkchen (überschreibt den Vorschlag)
 let editingIngredientId = null;
+// „✨ Ersetzen / Rausnehmen“ im KI-Entwurf: geöffnetes Feld { ingredientId, wish, status, isError, abort }
+let swap = null;
+let swapResult = null; // letzte KI-Änderung { text, hint, undo: Entwurf davor } für „Rückgängig“
+// Nur bei Entwürfen aus eingefügtem Text: { estimated: Map(zutatId → Originalzeile), unrecognized: [], matched }
+let draftImport = null;
+let draftFromAi = false; // Entwurf stammt von der KI → Hinweis anzeigen, bei Abbruch zurück zur KI-Karte
+let importOpen = false;
+let aiOpen = false;
 
 function renderRecipes() {
   $('#recipeList').hidden = !!recipeDraft;
   $('#recipeEditor').hidden = !recipeDraft;
+  $('#importCard').hidden = !!recipeDraft || !importOpen;
+  $('#aiCard').hidden = !!recipeDraft || !aiOpen;
+  $('#dislikeCard').hidden = !!recipeDraft;
   if (recipeDraft) return renderRecipeEditor();
-  const recipes = Object.values(state.recipes).sort((a, b) => a.name.localeCompare(b.name, 'de'));
+  if (aiOpen) renderAiCard();
+  renderDislikes();
+  const all = Object.values(state.recipes).sort((a, b) => a.name.localeCompare(b.name, 'de'));
+
+  // Filter nach Eigenschaften (alle gewählten müssen passen); nur zeigen, wenn Rezepte Eigenschaften haben
+  const usedTags = RECIPE_TAGS.filter(t => all.some(r => r.tags.includes(t.key)));
+  recipeFilterTags = recipeFilterTags.filter(key => usedTags.some(t => t.key === key));
+  const anyDisliked = all.some(r => recipeDislikes(r).length);
+  if (!anyDisliked) hideDisliked = false;
+  $('#recipeFilter').hidden = !usedTags.length && !anyDisliked;
+  $('#recipeFilter').innerHTML = usedTags.map(t => `
+    <button type="button" class="tag-chip" data-filter-tag="${t.key}" aria-pressed="${recipeFilterTags.includes(t.key)}">${t.icon} ${t.label}</button>`).join('')
+    + (anyDisliked ? `
+    <button type="button" class="tag-chip" data-filter-dislikes aria-pressed="${hideDisliked}">👎 ausblenden</button>` : '');
+
+  const recipes = all
+    .filter(r => recipeFilterTags.every(key => r.tags.includes(key)))
+    .filter(r => !hideDisliked || !recipeDislikes(r).length);
   $('#recipeItems').innerHTML = recipes.length
     ? `<ul class="recipe-items">${recipes.map(recipeRow).join('')}</ul>`
-    : '<p class="muted">Noch keine Rezepte. Lege ein Gericht aus mehreren Zutaten an und trage es danach mit wenigen Klicks als Portion ein.</p>';
+    : all.length
+      ? '<p class="muted">Keine Rezepte mit diesen Eigenschaften.</p>'
+      : '<p class="muted">Noch keine Rezepte. Lege ein Gericht aus mehreren Zutaten an und trage es danach mit wenigen Klicks als Portion ein.</p>';
+}
+
+/**
+ * Hinweise zu den Eigenschaften eines Entwurfs: Grenzwerte laut Nährwerten und offensichtliche
+ * tierische Zutaten (einfacher Wortabgleich, keine Garantie). Außerdem Vorschläge, welche Eigenschaft passt.
+ */
+const MEAT_FISH_PATTERN = /fleisch|hähnchen|hühnchen|huhn|hühner|puten|\bpute\b|rind|schwein|kalb|lamm|speck|schinken|salami|wurst|würstchen|bacon|chorizo|lachs|thunfisch|fisch|garnele|shrimp|krabbe|muschel|sardelle|anchovi|gelatine/i;
+const ANIMAL_PATTERN = /\beier?\b|eigelb|eiklar|eiweiß(?!pulver)|milch|butter|sahne|käse|quark|joghurt|jogurt|skyr|schmand|crème fraîche|creme fraiche|mascarpone|ricotta|mozzarella|parmesan|feta|halloumi|molke|whey|honig/i;
+const PLANT_BASED_PATTERN = /vegan|pflanz|soja|tofu|hafer|mandel|kokos|cashew|reis(?:milch|drink)|erdnussbutter|kakaobutter|seitan|tempeh/i;
+
+function tagWarnings(recipe) {
+  const warnings = [];
+  const tags = recipe.tags || [];
+  const s = recipeStats(recipe);
+  const kcal = s.perServing.kcal || 0;
+  const protein = s.perServing.protein || 0;
+  const carbs = s.perServing.carbs || 0;
+  const ingredientsKnown = recipe.ingredients.length && recipe.ingredients.every(i => i.per100.kcal !== null);
+  if (ingredientsKnown && tags.includes('lowcal') && kcal > LOWCAL_MAX_KCAL) {
+    warnings.push(`kalorienarm: eine Portion hat ${fmt(kcal)} kcal (höchstens ${LOWCAL_MAX_KCAL} kcal)`);
+  }
+  if (ingredientsKnown && tags.includes('highcarb') && carbs < HIGHCARB_MIN_G) {
+    warnings.push(`kohlenhydratreich: eine Portion hat ${fmt(carbs, 1)} g Kohlenhydrate (mindestens ${HIGHCARB_MIN_G} g)`);
+  }
+  if (ingredientsKnown && tags.includes('highprotein') && protein < HIGHPROTEIN_MIN_G) {
+    warnings.push(`proteinreich: eine Portion hat ${fmt(protein, 1)} g Eiweiß (mindestens ${HIGHPROTEIN_MIN_G} g)`);
+  }
+  const conflicts = key => recipe.ingredients
+    .filter(i => !PLANT_BASED_PATTERN.test(i.name))
+    .filter(i => MEAT_FISH_PATTERN.test(i.name) || (key === 'vegan' && ANIMAL_PATTERN.test(i.name)))
+    .map(i => i.name);
+  const dietTag = tags.includes('vegan') ? 'vegan' : tags.includes('vegetarian') ? 'vegetarian' : '';
+  if (dietTag) {
+    const names = conflicts(dietTag);
+    if (names.length) warnings.push(`${TAG[dietTag].label}, aber diese Zutaten klingen nicht danach: ${names.join(', ')}`);
+  }
+  const suggestions = [];
+  if (ingredientsKnown && !tags.includes('lowcal') && kcal > 0 && kcal <= LOWCAL_MAX_KCAL) suggestions.push('lowcal');
+  if (ingredientsKnown && !tags.includes('highcarb') && carbs >= HIGHCARB_MIN_G) suggestions.push('highcarb');
+  if (ingredientsKnown && !tags.includes('highprotein') && protein >= HIGHPROTEIN_MIN_G) suggestions.push('highprotein');
+  return { warnings, suggestions };
 }
 
 function recipeRow(r) {
   const s = recipeStats(r);
   const p = s.perServing;
   const steps = instructionSteps(r.instructions);
+  const disliked = [...new Set(recipeDislikes(r).flatMap(x => x.entries))];
+  const badges = [
+    ...r.tags
+      .filter(key => !(key === 'vegetarian' && r.tags.includes('vegan'))) // „vegan“ reicht
+      .map(key => `<span class="recipe-tag">${TAG[key].icon} ${TAG[key].label}</span>`),
+    ...disliked.map(name => `<span class="recipe-tag dislike" title="Mag ich nicht">👎 ${esc(name)}</span>`),
+  ];
   return `
     <li class="recipe-item" data-id="${esc(r.id)}">
       <div class="recipe-info">
         <div class="recipe-name">${esc(r.name)}</div>
+        ${badges.length ? `<div class="recipe-tags">${badges.join('')}</div>` : ''}
         <div class="recipe-meta">${fmt(s.servings, 1)} ${s.servings === 1 ? 'Portion' : 'Portionen'} à ${fmt(s.servingG)} g · ${r.ingredients.length} ${r.ingredients.length === 1 ? 'Zutat' : 'Zutaten'}</div>
         <div class="recipe-meta">Pro Portion: <b>${fmt(p.kcal)} kcal</b> · E ${fmt(p.protein, 1)} g · K ${fmt(p.carbs, 1)} g · F ${fmt(p.fat, 1)} g</div>
+        ${r.sourceUrl ? `<a class="video-link" href="${esc(r.sourceUrl)}" target="_blank" rel="noopener noreferrer">▶ Video ansehen</a>` : ''}
         <details class="recipe-details">
           <summary>Zutaten${steps.length ? ' &amp; Zubereitung' : ''}</summary>
           <ul>${r.ingredients.map(i => `<li>${fmt(i.grams)} g ${esc(i.name)}</li>`).join('')}</ul>
@@ -1034,10 +1288,46 @@ function recipeRow(r) {
       </div>
       <div class="recipe-actions">
         <button type="button" class="btn small primary" data-recipe-log>Eintragen</button>
+        <button type="button" class="btn small" data-recipe-shop>🛒 Einkaufen</button>
         <button type="button" class="btn small" data-recipe-edit>Bearbeiten</button>
         <button type="button" class="icon-btn del" data-recipe-del aria-label="Rezept löschen" title="Löschen">✕</button>
       </div>
+      ${r.id === shopRecipeId ? shopAddForm(r) : ''}
     </li>`;
+}
+
+/** Aufgeklapptes „🛒 Einkaufen“: Portionen und eine Zutatenliste, in der Vorrätiges schon abgewählt ist. */
+function shopAddForm(r) {
+  const portions = shopPortions ?? r.servings;
+  const factor = portions > 0 ? portions / (r.servings > 0 ? r.servings : 1) : 0;
+  const rows = r.ingredients.map((ing, index) => {
+    const reason = shopSkipReason(ing.name);
+    const checked = shopChecks.has(index) ? shopChecks.get(index) : !reason;
+    const inPantry = reason === 'vorrätig';
+    return `
+      <li class="shop-pick${checked ? '' : ' off'}">
+        <label class="check">
+          <input type="checkbox" name="ing" value="${index}" ${checked ? 'checked' : ''}>
+          <span><span class="shop-amount" data-grams="${ing.grams}">${fmtShopGrams(ing.grams * factor)}</span>${esc(ing.name)}${
+            reason ? ` <span class="muted">(${reason})</span>` : ''}</span>
+        </label>
+        <button type="button" class="shop-chip${inPantry ? ' set' : ''}" data-pantry-toggle="${index}"
+          title="${inPantry ? 'Nicht mehr als vorrätig merken' : 'Als „zu Hause vorrätig“ merken'}">📦 ${inPantry ? 'vorrätig' : 'hab ich'}</button>
+      </li>`;
+  }).join('');
+  const count = r.ingredients.filter((ing, index) => (shopChecks.has(index) ? shopChecks.get(index) : !shopSkipReason(ing.name))).length;
+  return `
+    <form class="shop-add" novalidate>
+      <label class="field">Portionen
+        <input type="number" name="portions" min="0.5" step="0.5" value="${portions}" inputmode="decimal">
+      </label>
+      <ul class="shop-pick-list">${rows}</ul>
+      <p class="hint">Mit Häkchen kommt die Zutat auf die Einkaufsliste. „📦 hab ich“ merkt sich eine Zutat als vorrätig für alle Rezepte (änderbar im Reiter „Einkauf“).</p>
+      <div class="form-actions">
+        <button type="submit" class="btn small primary" data-shop-submit ${count ? '' : 'disabled'}>${count ? `${count} ${count === 1 ? 'Zutat' : 'Zutaten'} auf die Einkaufsliste` : 'Alles vorrätig'}</button>
+        <button type="button" class="btn small" data-shop-cancel>Abbrechen</button>
+      </div>
+    </form>`;
 }
 
 /** Zubereitungstext → einzelne Schritte (führende Nummern wie „1.“ werden entfernt). */
@@ -1058,17 +1348,38 @@ function nutrientsPlausible(p) {
   return Math.abs(p.kcal - expected) <= Math.max(30, p.kcal * 0.25);
 }
 
-function startRecipeEdit(recipe) {
+function startRecipeEdit(recipe, { importInfo = null, fromAi = false } = {}) {
+  if (!fromAi) aiAbort?.abort(); // anderes Rezept geöffnet: laufende KI-Anfrage würde es sonst überschreiben
+  swap?.abort?.abort();
+  swap = null;
+  swapResult = null;
   recipeDraft = recipe
     ? structuredClone(recipe)
-    : { id: `rec-${uid()}`, name: '', servings: 1, totalWeight: null, ingredients: [], instructions: '', updated: 0 };
+    : { id: `rec-${uid()}`, name: '', servings: 1, totalWeight: null, ingredients: [], instructions: '', sourceUrl: '', tags: [], updated: 0 };
+  recipeDraft.tags = normalizeTags(recipeDraft.tags);
+  draftImport = importInfo;
+  draftFromAi = fromAi;
   editingIngredientId = null;
   renderRecipes();
-  $('#recipeName').focus();
+  if (importInfo || fromAi) window.scrollTo(0, 0);
+  else $('#recipeName').focus();
 }
 
-function closeRecipeEditor() {
+function closeRecipeEditor({ saved = false } = {}) {
+  if (draftImport) {
+    if (saved) $('#importCard').reset(); // Text wurde verarbeitet
+    else importOpen = true; // verworfen → zurück zum eingefügten Text
+  }
+  if (draftFromAi) {
+    if (saved) $('#aiPrompt').value = '';
+    else aiOpen = true; // verworfen → zurück zur KI-Karte, Wunschtext bleibt stehen
+  }
+  swap?.abort?.abort();
+  swap = null;
+  swapResult = null;
   recipeDraft = null;
+  draftImport = null;
+  draftFromAi = false;
   editingIngredientId = null;
   renderRecipes();
 }
@@ -1079,6 +1390,7 @@ function renderRecipeEditor() {
   $('#recipeServings').value = recipeDraft.servings ?? '';
   $('#recipeWeight').value = recipeDraft.totalWeight ?? '';
   $('#recipeInstructions').value = recipeDraft.instructions ?? '';
+  $('#recipeUrl').value = recipeDraft.sourceUrl ?? '';
   setMsg($('#recipeMsg'), '');
   renderDraft();
 }
@@ -1086,15 +1398,45 @@ function renderRecipeEditor() {
 function renderDraft() {
   const items = recipeDraft.ingredients;
   $('#recipeIngredients').innerHTML = items.length
-    ? items.map(i => itemRow(i, 'ing-') + (i.id === editingIngredientId ? ingredientEditor(i) : '')).join('')
+    ? items.map(i => itemRow(i, 'ing-')
+      + (i.id === editingIngredientId ? ingredientEditor(i) : '')
+      + (i.id === swap?.ingredientId ? aiSwapPanel(i) : '')).join('')
     : '<li class="empty">Noch keine Zutaten.</li>';
 
-  const implausible = items.filter(i => !nutrientsPlausible(i.per100));
+  const notes = [];
+  if (swapResult) {
+    notes.push(`✨ ${esc(swapResult.text)}${swapResult.hint ? ` <span class="muted">${esc(swapResult.hint)}</span>` : ''}
+      <button type="button" class="btn small" data-swap-undo>↩ Rückgängig</button>`);
+  }
+  if (draftFromAi) {
+    notes.push('<b>Von der KI erstellt.</b> Mengen und Nährwerte sind Schätzungen. Prüfe sie, bevor du speicherst: Mit 🔍 übernimmst du Werte aus der Produktsuche, mit ✎ korrigierst du sie selbst, mit ✨ ersetzt oder entfernst du eine Zutat samt Zubereitung.');
+  }
+  if (draftImport) {
+    const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+    notes.push(`<b>Aus dem Text erkannt:</b> ${count(items.length, 'Zutat', 'Zutaten')}${draftImport.matched
+      ? `, davon ${draftImport.matched} mit Nährwerten aus deinen gespeicherten Produkten` : ''}. Bitte prüfe alles, bevor du speicherst.`);
+    const estimated = items.filter(i => draftImport.estimated.has(i.id));
+    if (estimated.length) {
+      notes.push(`Mengen geschätzt, bitte prüfen: ${estimated
+        .map(i => `${esc(i.name)} („${esc(draftImport.estimated.get(i.id))}“ → ${fmt(i.grams, 1)} g)`).join('; ')}`);
+    }
+    const skipped = draftImport.unrecognized;
+    if (skipped.length) {
+      notes.push(`Nicht als Zutat erkannt und ausgelassen: ${skipped.slice(0, 5).map(l => `„${esc(l)}“`).join(', ')}${
+        skipped.length > 5 ? ` und ${skipped.length - 5} weitere Zeilen` : ''}`);
+    }
+  }
+  const missing = items.filter(i => i.per100.kcal === null);
+  if (missing.length) {
+    notes.push(`🔍 Bei ${missing.length === 1 ? 'einer Zutat fehlen' : `${missing.length} Zutaten fehlen`} noch die Nährwerte. Tippe auf „Nährwerte suchen“ oder trage sie mit ✎ selbst ein (für Wasser oder Salz einfach 0 kcal).`);
+  }
+  const implausible = items.filter(i => i.per100.kcal !== null && !nutrientsPlausible(i.per100));
   for (const i of implausible) $(`#recipeIngredients .entry[data-id="${CSS.escape(i.id)}"]`)?.classList.add('warn');
-  $('#recipeNote').innerHTML = implausible.length
-    ? `<p>⚠ Bitte prüfen (✎), die Kalorien passen nicht zu Eiweiß, Kohlenhydraten und Fett: ${implausible.map(i => esc(i.name)).join(', ')}</p>`
-    : '';
-  $('#recipeNote').hidden = !implausible.length;
+  if (implausible.length) {
+    notes.push(`⚠ Bitte prüfen (✎), die Kalorien passen nicht zu Eiweiß, Kohlenhydraten und Fett: ${implausible.map(i => esc(i.name)).join(', ')}`);
+  }
+  $('#recipeNote').innerHTML = notes.map(n => `<p>${n}</p>`).join('');
+  $('#recipeNote').hidden = !notes.length;
   renderDraftNutrition();
 }
 
@@ -1130,11 +1472,32 @@ function applyIngredientEdit(box) {
   if (NUTRIENTS.some(n => per100[n.key] !== null && per100[n.key] < 0)) return setMsg(msg, 'Nährwerte dürfen nicht negativ sein.', true);
   ingredient.name = name;
   ingredient.per100 = per100;
+  if (ingredient.brand === AI_BRAND) ingredient.brand = ''; // vom Nutzer geprüft
   editingIngredientId = null;
   renderDraft();
 }
 
+function renderDraftTags() {
+  $('#recipeTags').innerHTML = tagChips(recipeDraft.tags, 'draft-tag');
+  const { warnings, suggestions } = tagWarnings(recipeDraft);
+  const notes = warnings.map(w => `<p>⚠ ${esc(w)}</p>`);
+  const disliked = recipeDislikes(recipeDraft);
+  if (disliked.length) {
+    notes.unshift(`<p>👎 Enthält Zutaten, die du nicht magst: ${disliked
+      .map(x => (x.entries.some(e => e.toLowerCase() === x.ingredient.toLowerCase())
+        ? esc(x.ingredient)
+        : `${esc(x.ingredient)} (${x.entries.map(esc).join(', ')})`)).join(', ')}</p>`);
+  }
+  if (suggestions.length) {
+    notes.push(`<p>💡 Laut Nährwerten passt auch: ${suggestions
+      .map(key => `<button type="button" class="tag-chip" data-draft-tag="${key}" aria-pressed="false">${TAG[key].icon} ${TAG[key].label}</button>`).join(' ')}</p>`);
+  }
+  $('#recipeTagNote').innerHTML = notes.join('');
+  $('#recipeTagNote').hidden = !notes.length;
+}
+
 function renderDraftNutrition() {
+  renderDraftTags(); // Grenzwerte hängen von Zutaten und Portionen ab
   const s = recipeStats(recipeDraft);
   $('#recipeWeight').placeholder = s.rawWeight ? `${fmt(s.rawWeight)} (Summe)` : 'Summe der Zutaten';
   if (!recipeDraft.ingredients.length) {
@@ -1171,12 +1534,52 @@ function isDraftDirty() {
 function bindRecipeEvents() {
   $('#newRecipeBtn').addEventListener('click', () => startRecipeEdit(null));
 
+  $('#recipeFilter').addEventListener('click', ev => {
+    if (ev.target.closest('[data-filter-dislikes]')) {
+      hideDisliked = !hideDisliked;
+      renderRecipes();
+      return;
+    }
+    const chip = ev.target.closest('[data-filter-tag]');
+    if (!chip) return;
+    const key = chip.dataset.filterTag;
+    recipeFilterTags = recipeFilterTags.includes(key) ? recipeFilterTags.filter(k => k !== key) : [...recipeFilterTags, key];
+    renderRecipes();
+  });
+
+  // Eigenschaften im Editor (auch die Vorschläge im Hinweis) an- und abwählen
+  for (const container of ['#recipeTags', '#recipeTagNote']) {
+    $(container).addEventListener('click', ev => {
+      const chip = ev.target.closest('[data-draft-tag]');
+      if (!chip || !recipeDraft) return;
+      recipeDraft.tags = toggleTag(recipeDraft.tags, chip.dataset.draftTag);
+      renderDraftTags();
+    });
+  }
+
   $('#recipeItems').addEventListener('click', ev => {
     const li = ev.target.closest('.recipe-item');
     const recipe = li && state.recipes[li.dataset.id];
     if (!recipe) return;
     if (ev.target.closest('[data-recipe-log]')) {
       openDialog({ target: 'diary', title: `Eintragen: ${formatDateLabel(currentDate)}`, food: recipeAsFood(recipe) });
+    } else if (ev.target.closest('[data-recipe-shop]')) {
+      shopRecipeId = shopRecipeId === recipe.id ? null : recipe.id;
+      shopPortions = null;
+      shopChecks = new Map();
+      renderRecipes();
+      $(`.recipe-item[data-id="${CSS.escape(recipe.id)}"] input[name="portions"]`)?.focus();
+    } else if (ev.target.closest('[data-pantry-toggle]')) {
+      const index = Number(ev.target.closest('[data-pantry-toggle]').dataset.pantryToggle);
+      const ing = recipe.ingredients[index];
+      if (!ing) return;
+      if (pantryMatches(ing.name).length) removeFromPantry(ing.name);
+      else addToPantry(ing.name);
+      shopChecks.delete(index); // Vorschlag passt sich an den Vorrat an
+      renderRecipes();
+    } else if (ev.target.closest('[data-shop-cancel]')) {
+      shopRecipeId = null;
+      renderRecipes();
     } else if (ev.target.closest('[data-recipe-edit]')) {
       startRecipeEdit(recipe);
     } else if (ev.target.closest('[data-recipe-del]')) {
@@ -1184,6 +1587,40 @@ function bindRecipeEvents() {
       delete state.recipes[recipe.id];
       saveState();
       renderRecipes();
+    }
+  });
+
+  $('#recipeItems').addEventListener('submit', ev => {
+    ev.preventDefault();
+    const recipe = state.recipes[ev.target.closest('.recipe-item')?.dataset.id];
+    if (!recipe) return;
+    const portions = toNum(ev.target.elements.portions.value);
+    if (!(portions > 0)) {
+      showToast('Bitte eine Portionenzahl größer als 0 eingeben.', true);
+      return;
+    }
+    const selected = new Set($$('input[name="ing"]', ev.target).filter(cb => cb.checked).map(cb => Number(cb.value)));
+    if (!selected.size) return;
+    addRecipeToShopping(recipe, portions, selected);
+    shopRecipeId = null;
+    renderRecipes();
+  });
+
+  // Häkchen und Portionen live übernehmen, ohne das Formular neu zu zeichnen (Fokus bleibt)
+  $('#recipeItems').addEventListener('change', ev => {
+    if (!ev.target.matches('.shop-add input[name="ing"]')) return;
+    shopChecks.set(Number(ev.target.value), ev.target.checked);
+    ev.target.closest('.shop-pick').classList.toggle('off', !ev.target.checked);
+    updateShopSubmit(ev.target.form);
+  });
+  $('#recipeItems').addEventListener('input', ev => {
+    if (!ev.target.matches('.shop-add input[name="portions"]')) return;
+    const recipe = state.recipes[shopRecipeId];
+    if (!recipe) return;
+    shopPortions = toNum(ev.target.value);
+    const factor = shopPortions > 0 ? shopPortions / (recipe.servings > 0 ? recipe.servings : 1) : 0;
+    for (const amount of $$('.shop-amount[data-grams]', ev.target.form)) {
+      amount.textContent = fmtShopGrams(Number(amount.dataset.grams) * factor);
     }
   });
 
@@ -1199,8 +1636,20 @@ function bindRecipeEvents() {
   $('#addIngredientBtn').addEventListener('click', () => openDialog({ target: 'recipe', title: 'Zutat hinzufügen' }));
 
   $('#recipeInstructions').addEventListener('input', ev => { recipeDraft.instructions = ev.target.value; });
+  $('#recipeUrl').addEventListener('input', ev => { recipeDraft.sourceUrl = ev.target.value.trim(); });
 
   $('#recipeIngredients').addEventListener('click', ev => {
+    const swapBox = ev.target.closest('.ai-swap');
+    if (swapBox) {
+      if (ev.target.closest('[data-swap-replace]')) runIngredientSwap('replace');
+      else if (ev.target.closest('[data-swap-remove]')) runIngredientSwap('remove');
+      else if (ev.target.closest('[data-swap-cancel]')) {
+        swap?.abort?.abort();
+        swap = null;
+        renderDraft();
+      }
+      return;
+    }
     const box = ev.target.closest('.ing-edit');
     if (box) {
       if (ev.target.closest('[data-ing-apply]')) applyIngredientEdit(box);
@@ -1214,7 +1663,20 @@ function bindRecipeEvents() {
     if (!row) return;
     if (ev.target.closest('[data-ing-del]')) {
       recipeDraft.ingredients = recipeDraft.ingredients.filter(i => i.id !== row.dataset.id);
+      if (swap?.ingredientId === row.dataset.id) {
+        swap.abort?.abort(); // KI-Anpassung für diese Zutat ist hinfällig
+        swap = null;
+      }
       renderDraft();
+    } else if (ev.target.closest('[data-ing-ai]')) {
+      if (swap?.abort) return; // KI arbeitet gerade an einer anderen Zutat
+      swap = swap?.ingredientId === row.dataset.id ? null : { ingredientId: row.dataset.id, wish: '', status: '', isError: false, abort: null };
+      editingIngredientId = null;
+      renderDraft();
+      $('#recipeIngredients [data-swap-input]')?.focus();
+    } else if (ev.target.closest('[data-ing-lookup]')) {
+      const ingredient = recipeDraft.ingredients.find(i => i.id === row.dataset.id);
+      if (ingredient) openIngredientLookup(ingredient);
     } else if (ev.target.closest('[data-ing-edit]')) {
       editingIngredientId = editingIngredientId === row.dataset.id ? null : row.dataset.id;
       renderDraft();
@@ -1225,9 +1687,20 @@ function bindRecipeEvents() {
   $('#recipeIngredients').addEventListener('keydown', ev => {
     if (ev.key !== 'Enter' || !ev.target.matches('input')) return;
     ev.preventDefault();
+    if (ev.target.matches('[data-swap-input]')) return runIngredientSwap('replace');
     const box = ev.target.closest('.ing-edit');
     if (box) applyIngredientEdit(box);
     else ev.target.blur(); // löst „change“ der Mengeneingabe aus
+  });
+  $('#recipeIngredients').addEventListener('input', ev => {
+    if (ev.target.matches('[data-swap-input]') && swap) swap.wish = ev.target.value;
+  });
+  $('#recipeNote').addEventListener('click', ev => {
+    if (!ev.target.closest('[data-swap-undo]') || !swapResult) return;
+    recipeDraft = swapResult.undo;
+    swapResult = null;
+    swap = null;
+    renderRecipeEditor(); // Name und Zubereitung stehen in eigenen Feldern
   });
   $('#recipeIngredients').addEventListener('change', ev => {
     if (!ev.target.matches('[data-ing-grams]')) return;
@@ -1235,6 +1708,7 @@ function bindRecipeEvents() {
     const grams = toNum(ev.target.value);
     if (ingredient && grams !== null && grams > 0) {
       ingredient.grams = grams;
+      draftImport?.estimated.delete(ingredient.id); // Menge wurde von Hand bestätigt
     } else {
       showToast('Die Menge muss größer als 0 sein. Zum Entfernen ✕ benutzen.', true);
     }
@@ -1253,16 +1727,1540 @@ function bindRecipeEvents() {
     }
     if (!d.ingredients.length) return setMsg(msg, 'Füge mindestens eine Zutat hinzu.', true);
     if (editingIngredientId) return setMsg(msg, 'Bitte die geöffnete Zutat erst übernehmen oder abbrechen.', true);
+    if (swap?.abort) return setMsg(msg, 'Die KI passt das Rezept gerade an. Bitte kurz warten.', true);
+    const missing = d.ingredients.filter(i => i.per100.kcal === null);
+    if (missing.length) {
+      return setMsg(msg, `Bei ${missing.map(i => `„${i.name}“`).join(', ')} fehlen noch die Nährwerte. Suche sie über „Nährwerte suchen“ oder trage sie mit ✎ ein.`, true);
+    }
+    d.sourceUrl = (d.sourceUrl ?? '').trim();
+    if (d.sourceUrl && !isHttpUrl(d.sourceUrl)) return setMsg(msg, 'Der Link zum Video muss mit https:// beginnen.', true);
     d.instructions = d.instructions.trim();
     state.recipes[d.id] = { ...d, updated: Date.now() };
     if (!saveState()) return;
-    closeRecipeEditor();
+    closeRecipeEditor({ saved: true });
     showToast(`Rezept „${d.name}“ gespeichert`);
   });
 
   $('#cancelRecipeBtn').addEventListener('click', () => {
     if (isDraftDirty() && !confirm('Ungespeicherte Änderungen verwerfen?')) return;
     closeRecipeEditor();
+  });
+}
+
+// =====================================================================
+// Rezept aus Text (kopierte Beschreibung eines TikTok-/Instagram-Videos)
+// =====================================================================
+
+// Gramm pro Einheit; est = nur ein Richtwert, der im Editor als „geschätzt“ markiert wird.
+// grams null = Stückzahl, Gewicht kommt aus PIECE_WEIGHTS.
+const UNITS = {};
+for (const [names, grams, est] of [
+  ['g gr gramm', 1], ['kg', 1000], ['mg', 0.001], ['ml', 1], ['l liter', 1000], ['cl', 10], ['dl', 100],
+  ['oz', 28.35], ['lb lbs', 453.6],
+  ['el esslöffel tbsp', 12, true], ['tl teelöffel tsp', 5, true],
+  ['prise prisen', 0.5, true], ['msp messerspitze', 0.3, true],
+  ['tasse tassen cup cups', 200, true], ['becher', 200, true], ['dose dosen', 400, true], ['glas gläser', 350, true],
+  ['packung packungen pck pkg', 250, true], ['päckchen', 15, true],
+  ['scheibe scheiben', 25, true], ['bund', 50, true], ['handvoll', 30, true], ['zehe zehen', 4, true],
+  ['schuss', 10, true], ['spritzer', 5, true], ['würfel', 10, true], ['scoop scoops messlöffel', 30, true],
+  ['stück stk stck', null, true],
+]) {
+  for (const name of names.split(' ')) UNITS[name] = { grams, est: Boolean(est) };
+}
+
+// Typisches Gewicht pro Stück (erste passende Zeile gewinnt, daher Spezielles vor Allgemeinem)
+const PIECE_WEIGHTS = [
+  [/frühlingszwiebel|lauchzwiebel/, 15], [/zwiebel/, 80], [/schalotte/, 25], [/knoblauch/, 4],
+  [/cherrytomate|kirschtomate|cocktailtomate|datteltomate/, 15], [/tomate/, 100],
+  [/süßkartoffel/, 250], [/kartoffel/, 150], [/karotte|möhre/, 80],
+  [/paprika(?!pulver|mark)/, 150], [/zucchini/, 250], [/aubergine/, 300], [/gurke/, 400], [/avocado/, 150],
+  [/champignon|pilz/, 20], [/chili(?!flocken|pulver|sauce|soße)/, 5],
+  [/banane/, 120], [/apfel|äpfel/, 150], [/birne/, 150], [/orange/, 150], [/zitrone/, 100], [/limette/, 60], [/dattel/, 8],
+  [/eigelb/, 18], [/eiweiß(?!pulver)|eiklar/, 35], [/\beier?\b/, 60],
+  [/brötchen/, 60], [/toast/, 25], [/tortilla|wrap/, 60], [/pita/, 80],
+  [/hähnchenbrust|hühnerbrust|putenbrust|hähnchenfilet/, 150], [/lachsfilet/, 125],
+  [/mozzarella/, 125], [/feta/, 200],
+];
+const DEFAULT_PIECE_G = 100;
+
+const SPICES = /salz|pfeffer|gewürz|paprikapulver|currypulver|curry|kurkuma|zimt|muskat|oregano|basilikum|thymian|rosmarin|petersilie|schnittlauch|kräuter|chiliflocken|knoblauchpulver|zwiebelpulver|backpulver|natron|vanille|kümmel|majoran|dill|koriander|cayenne|sesam/i;
+
+const FRACTION_CHARS = { '½': 0.5, '¼': 0.25, '¾': 0.75, '⅓': 1 / 3, '⅔': 2 / 3, '⅛': 0.125 };
+const NUMBER_WORDS = {
+  ein: 1, eine: 1, einen: 1, einem: 1, einer: 1, eins: 1, zwei: 2, drei: 3, vier: 4, fünf: 5, sechs: 6,
+  halbe: 0.5, halben: 0.5, halber: 0.5, halbes: 0.5, a: 1, an: 1, one: 1, two: 2, three: 3, half: 0.5,
+};
+const NUM = String.raw`\d+(?:[.,]\d+)?(?:\s+\d+\/\d+|\s*[½¼¾⅓⅔⅛])?|\d+\/\d+|[½¼¾⅓⅔⅛]`;
+// Menge am Zeilenanfang, auch als Spanne („2-3“); danach muss Leerraum, ein Buchstabe oder das Ende kommen („3-Zutaten-Brot“ ist keine Menge)
+const AMOUNT_START = new RegExp(String.raw`^(?:ca\.?|circa|etwa|about)?\s*(${NUM})(?:\s*(?:-|–|bis)\s*(${NUM}))?(?=[\sa-zäöüß]|$)`, 'i');
+const INGREDIENT_HEADER = /^(?:die\s+)?(?:zutaten|ingredients?|du brauchst|was du brauchst|das brauchst du|einkaufsliste)\b/i;
+const STEPS_HEADER = /^(?:zubereitung|anleitung|so geht'?s|so wird'?s gemacht|schritte|arbeitsschritte|instructions?|directions|method|steps|how to)\b/i;
+
+function parseNumber(s) {
+  let text = s.trim();
+  let total = 0;
+  const fraction = text.match(/[½¼¾⅓⅔⅛]/);
+  if (fraction) {
+    total += FRACTION_CHARS[fraction[0]];
+    text = text.replace(fraction[0], '').trim();
+  }
+  const mixed = text.match(/^(\d+)\s+(\d+)\/(\d+)$/);
+  if (mixed) return total + Number(mixed[1]) + mixed[2] / mixed[3];
+  const simple = text.match(/^(\d+)\/(\d+)$/);
+  if (simple) return total + simple[1] / simple[2];
+  return total + (toNum(text) ?? 0);
+}
+
+function pieceWeight(name) {
+  const lower = name.toLowerCase();
+  return PIECE_WEIGHTS.find(([pattern]) => pattern.test(lower))?.[1] ?? DEFAULT_PIECE_G;
+}
+
+/** Entfernt Emojis, Hashtags, Erwähnungen und Aufzählungszeichen. */
+function cleanLine(raw) {
+  return raw
+    .replace(/(\d)️?⃣/gu, '$1.') // Tasten-Emoji „1️⃣“ → „1.“
+    .replace(/[\p{Extended_Pictographic}\u{FE0F}\u{200D}]/gu, ' ')
+    .replace(/#[\p{L}\p{N}_]+/gu, ' ')
+    .replace(/(^|\s)@[\w.]+/g, ' ')
+    .replace(/^[\s\-–—•*·▪●○◦►▶→>✓✔☐☑▢□]+/u, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function stripStepNumber(line) {
+  return line.replace(/^(?:\d+[.)]|schritt\s*\d+:?|step\s*\d+:?)\s*/i, '').trim();
+}
+
+/** „200 g Mehl“, „2 EL Öl“, „1 Dose Tomaten (400 g)“, „Mehl: 200 g“, „Salz“ → { name, grams, estimated, hadAmount } */
+function parseIngredientLine(line) {
+  let text = line;
+  let explicitGrams = null;
+  text = text.replace(/\(\s*(?:ca\.?\s*|je\s*)?(\d+(?:[.,]\d+)?)\s*(?:g|gr|gramm|ml)\s*\)/i, (_, n) => {
+    explicitGrams = toNum(n);
+    return ' ';
+  });
+
+  let amount = null;
+  let unit = null;
+  const start = text.match(AMOUNT_START);
+  if (start) {
+    amount = parseNumber(start[1]);
+    if (start[2]) amount = (amount + parseNumber(start[2])) / 2;
+    text = text.slice(start[0].length).replace(/^\s*x(?=\s)/i, '');
+  } else {
+    const word = text.match(/^\s*([a-zäöüß]+)\s+/i);
+    if (word && NUMBER_WORDS[word[1].toLowerCase()] !== undefined) {
+      amount = NUMBER_WORDS[word[1].toLowerCase()];
+      text = text.slice(word[0].length);
+    }
+  }
+  const unitMatch = text.match(/^\s*([a-zäöüß]+)\.?(?=[\s,(]|$)/i);
+  if (unitMatch && UNITS[unitMatch[1].toLowerCase()]) {
+    unit = UNITS[unitMatch[1].toLowerCase()];
+    text = text.slice(unitMatch[0].length);
+    if (amount === null) amount = 1; // „Prise Salz“
+  }
+  if (amount === null) {
+    const end = text.match(/^(.*?)[\s:,–-]*\b(\d+(?:[.,]\d+)?)\s*(g|gr|kg|ml|l|el|tl)\.?\s*$/i);
+    if (end && end[1].trim()) {
+      text = end[1];
+      amount = toNum(end[2]);
+      unit = UNITS[end[3].toLowerCase()];
+    }
+  }
+
+  const name = text
+    .replace(/\(.*?\)/g, ' ')
+    .split(/,|\s[-–]\s/)[0]
+    .replace(/^\s*(?:von|vom|der|die|das|of)\s+/i, '')
+    .replace(/^(?:etwas|n\.\s*b\.|nach belieben)\s+/i, '')
+    .replace(/\s+(?:nach belieben|n\.\s*b\.|zum (?:braten|anbraten|garnieren|servieren|bestreuen))\.?$/i, '')
+    .replace(/[:;.!]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!name || !/[a-zäöüß]/i.test(name)) return null;
+
+  let grams;
+  let estimated = false;
+  if (unit && !unit.est) {
+    grams = amount * unit.grams;
+  } else if (explicitGrams) {
+    grams = explicitGrams * (amount || 1);
+  } else if (unit) {
+    grams = amount * (unit.grams ?? pieceWeight(name));
+    estimated = true;
+  } else if (amount !== null) {
+    grams = amount * pieceWeight(name);
+    estimated = true;
+  } else {
+    grams = SPICES.test(name) ? 2 : 20; // Menge fehlt im Text
+    estimated = true;
+  }
+  if (!(grams > 0)) return null;
+  return {
+    name: name.charAt(0).toUpperCase() + name.slice(1),
+    grams: round(grams, 1),
+    estimated,
+    hadAmount: amount !== null || explicitGrams !== null,
+    source: line,
+  };
+}
+
+/** Zerlegt eingefügten Text in Titel, Portionen, Link, Zutaten und Schritte. */
+function parseRecipeText(text) {
+  const result = { name: '', servings: null, sourceUrl: '', ingredients: [], steps: [], unrecognized: [] };
+  let section = 'auto'; // bis eine Überschrift wie „Zutaten“ oder „Zubereitung“ kommt
+
+  for (const raw of String(text).split(/\r?\n/)) {
+    let line = raw;
+    const url = line.match(/https?:\/\/\S+/i);
+    if (url) {
+      if (!result.sourceUrl) result.sourceUrl = url[0];
+      line = line.replace(/https?:\/\/\S+/gi, ' ');
+    }
+    line = cleanLine(line);
+    if (!line || !/[\p{L}\d½¼¾]/u.test(line)) continue;
+    const words = line.split(' ').length;
+
+    if (!result.servings && section !== 'steps' && words <= 8) {
+      const servings = line.match(/(\d+)\s*(?:portionen|portion|personen|person|servings?)\b/i)
+        || line.match(/\b(?:für|for)\s+(\d+)\b(?!\s*(?:min|minuten|sek|std|stunden|grad|°))/i);
+      if (servings) result.servings = Number(servings[1]);
+    }
+    if (INGREDIENT_HEADER.test(line) && words <= 8) { section = 'ingredients'; continue; }
+    if (STEPS_HEADER.test(line) && words <= 6) { section = 'steps'; continue; }
+    if (/:$/.test(line) && words <= 5) continue; // Zwischenüberschrift wie „Für die Soße:“
+
+    if (section === 'steps') {
+      const step = stripStepNumber(line);
+      if (step) result.steps.push(step);
+      continue;
+    }
+    if (section === 'auto' && /^(?:\d+[.)]|schritt\s*\d+:?|step\s*\d+:?)\s+\D/i.test(line)) {
+      result.steps.push(stripStepNumber(line));
+      continue;
+    }
+
+    const parsed = parseIngredientLine(line);
+    const shortName = parsed && parsed.name.split(' ').length <= 6; // lange Sätze mit Zahlen sind eher Schritte
+    if (parsed && shortName && parsed.hadAmount) {
+      result.ingredients.push(parsed);
+      continue;
+    }
+    // Zeilen ohne Menge wie „Salz, Pfeffer“ → einzelne Zutaten mit geschätzter Menge
+    const parts = words <= 8
+      ? line.split(/,|\s+und\s+|\s*&\s*|\s+\+\s+/i).map(part => parseIngredientLine(part)).filter(p => p && p.name.split(' ').length <= 4)
+      : [];
+    if (section === 'ingredients') {
+      if (parts.length) result.ingredients.push(...parts);
+      else result.unrecognized.push(line);
+      continue;
+    }
+    // Ohne Überschriften: erste kurze Zeile ist der Titel, längere Sätze nach den Zutaten sind Schritte
+    if (!result.name && !result.ingredients.length && words <= 10) {
+      result.name = line.replace(/[:!.]+$/, '');
+    } else if (result.ingredients.length && words >= 5) {
+      result.steps.push(stripStepNumber(line));
+    } else if (parts.length && parts.every(p => SPICES.test(p.name))) {
+      result.ingredients.push(...parts);
+    } else {
+      result.unrecognized.push(line);
+    }
+  }
+  return result;
+}
+
+/** Gespeichertes Produkt, dessen Name alle Wörter der Zutat enthält (zuletzt verwendetes zuerst). */
+function matchSavedFood(name) {
+  const wordsOf = s => s.toLowerCase().split(/[^a-zäöüß0-9]+/).filter(w => w.length > 1);
+  const wanted = wordsOf(name);
+  if (!wanted.length) return null;
+  return Object.values(state.foods)
+    .filter(f => {
+      const have = wordsOf(f.name);
+      return wanted.every(w => have.includes(w));
+    })
+    .sort((a, b) => b.lastUsed - a.lastUsed)[0] || null;
+}
+
+function bindImportEvents() {
+  $('#importOpenBtn').addEventListener('click', () => {
+    importOpen = true;
+    renderRecipes();
+    $('#importText').focus();
+  });
+  $('#importClose').addEventListener('click', () => {
+    importOpen = false;
+    renderRecipes();
+  });
+
+  $('#importCard').addEventListener('submit', ev => {
+    ev.preventDefault();
+    const msg = $('#importMsg');
+    const text = $('#importText').value;
+    if (!text.trim()) return setMsg(msg, 'Bitte zuerst den Text aus dem Video einfügen.', true);
+    const parsed = parseRecipeText(text);
+    if (!parsed.ingredients.length) {
+      return setMsg(msg, 'Im Text wurden keine Zutaten gefunden. Am besten klappt es mit einer Liste wie „200 g Mehl“, eine Zutat pro Zeile.', true);
+    }
+    setMsg(msg, '');
+
+    const estimated = new Map();
+    let matched = 0;
+    const emptyPer100 = Object.fromEntries(NUTRIENTS.map(n => [n.key, null]));
+    const ingredients = parsed.ingredients.map(p => {
+      const food = matchSavedFood(p.name);
+      const ingredient = {
+        id: uid(),
+        name: food ? food.name : p.name,
+        brand: food ? food.brand : '',
+        code: food ? food.code : '',
+        grams: p.grams,
+        per100: food ? { ...food.per100 } : { ...emptyPer100 },
+      };
+      if (food) matched++;
+      if (p.estimated) estimated.set(ingredient.id, p.source);
+      return ingredient;
+    });
+
+    const servingsInput = toNum($('#importServings').value);
+    const url = $('#importUrl').value.trim();
+    importOpen = false;
+    startRecipeEdit({
+      id: `rec-${uid()}`,
+      name: parsed.name || 'Rezept aus Video',
+      servings: servingsInput > 0 ? servingsInput : parsed.servings || 1,
+      totalWeight: null,
+      ingredients,
+      instructions: parsed.steps.join('\n'),
+      sourceUrl: isHttpUrl(url) ? url : parsed.sourceUrl,
+      updated: 0,
+    }, { importInfo: { estimated, unrecognized: parsed.unrecognized, matched } });
+  });
+}
+
+// =====================================================================
+// KI-Rezepte (Google Gemini, direkt aus dem Browser)
+// =====================================================================
+
+// Schlüssel und Modell bewusst außerhalb von `state`: kommen nicht ins Backup und nicht in geteilte Dateien
+const AI_KEY_STORAGE = 'kalorienTracker.geminiKey';
+const AI_MODEL_STORAGE = 'kalorienTracker.geminiModel';
+const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+const AI_FALLBACK_MODEL = 'gemini-2.5-flash';
+const AI_TIMEOUT_MS = 120000;
+const AI_BRAND = 'KI-Schätzung';
+
+// Deutsche Feldnamen im Antwortschema; Nährstoffe ohne Eintrag hier fragt die KI nicht ab
+const AI_FIELDS = {
+  kcal: 'kcal_100g',
+  protein: 'eiweiss_100g',
+  carbs: 'kohlenhydrate_100g',
+  fat: 'fett_100g',
+  fiber: 'ballaststoffe_100g',
+};
+
+const AI_SCHEMA = (() => {
+  const nutrientFields = NUTRIENTS.map(n => AI_FIELDS[n.key]).filter(Boolean);
+  const ingredientProps = ['name', 'menge_g', ...nutrientFields];
+  return {
+    type: 'OBJECT',
+    properties: {
+      name: { type: 'STRING' },
+      zutaten: {
+        type: 'ARRAY',
+        items: {
+          type: 'OBJECT',
+          properties: Object.fromEntries(ingredientProps.map(f => [f, { type: f === 'name' ? 'STRING' : 'NUMBER' }])),
+          required: ingredientProps,
+          propertyOrdering: ingredientProps,
+        },
+      },
+      zubereitung: { type: 'ARRAY', items: { type: 'STRING' } },
+    },
+    required: ['name', 'zutaten', 'zubereitung'],
+    propertyOrdering: ['name', 'zutaten', 'zubereitung'],
+  };
+})();
+
+const AI_SYSTEM_PROMPT = `Du bist Koch und Ernährungsberater und erstellst alltagstaugliche Rezepte auf Deutsch mit Zutaten aus deutschen Supermärkten.
+
+Antworte im vorgegebenen JSON-Schema:
+- "name": kurzer Rezeptname.
+- "zutaten": alle Zutaten für ALLE Portionen zusammen, auch Öl, Butter und Gewürze.
+  - "menge_g": Gramm im abgewogenen Zustand (Nudeln, Reis, Hülsenfrüchte roh bzw. trocken; Fleisch und Fisch roh; Flüssigkeiten 1 ml = 1 g).
+  - Nährwerte pro 100 g der Zutat in genau diesem Zustand, realistische Durchschnittswerte. Kohlenhydrate ohne Ballaststoffe.
+  - Die Kalorien müssen zu den Makros passen: kcal ≈ 4 × Eiweiß + 4 × Kohlenhydrate + 9 × Fett + 2 × Ballaststoffe.
+- "zubereitung": kurze Arbeitsschritte ohne Nummerierung.`;
+
+let aiAbort = null;
+let aiModels = null; // in dieser Sitzung geladene Modell-IDs; null = noch nicht geladen
+
+class AiError extends Error {
+  constructor(message, { aborted = false, badKey = false, badModel = false } = {}) {
+    super(message);
+    Object.assign(this, { aborted, badKey, badModel });
+  }
+}
+
+function readLocal(key) {
+  try { return localStorage.getItem(key) || ''; } catch { return ''; }
+}
+
+function writeLocal(key, value) {
+  try {
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function geminiError(status, data) {
+  const message = String(data?.error?.message || '');
+  const reasons = (data?.error?.details || []).map(d => d?.reason).filter(Boolean);
+  if (reasons.includes('API_KEY_INVALID') || /api key not valid|api_key_invalid/i.test(message)) {
+    return new AiError('Der API-Schlüssel ist ungültig. Prüfe, ob du ihn vollständig kopiert hast.', { badKey: true });
+  }
+  if (status === 429) {
+    return new AiError('Das kostenlose Kontingent von Gemini ist gerade ausgeschöpft. Bitte in ein paar Minuten nochmal versuchen, spätestens morgen geht es wieder.');
+  }
+  if (status === 403) {
+    return new AiError('Google lehnt diesen API-Schlüssel ab. Erstelle in Google AI Studio einen neuen Schlüssel und trage ihn hier ein.', { badKey: true });
+  }
+  if (status === 404) {
+    return new AiError('Das gewählte KI-Modell ist nicht mehr verfügbar. Bitte nochmal versuchen, die App wählt automatisch ein anderes.', { badModel: true });
+  }
+  if (/location is not supported/i.test(message)) {
+    return new AiError('Google Gemini ist in deinem Land nicht verfügbar.');
+  }
+  if (status >= 500) return new AiError('Gemini ist gerade überlastet. Bitte gleich nochmal versuchen.');
+  return new AiError(`Gemini meldet einen Fehler (${status})${message ? `: ${message}` : ''}.`);
+}
+
+/** Anfrage an die Gemini-API mit Zeitlimit; `signal` kann zusätzlich von „Abbrechen“ kommen. */
+async function geminiFetch(path, { key, body = null, signal = null, timeoutMs = AI_TIMEOUT_MS } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort('timeout'), timeoutMs);
+  const onCancel = () => ctrl.abort('cancel');
+  signal?.addEventListener('abort', onCancel);
+  try {
+    const res = await fetch(`${GEMINI_BASE}/${path}`, {
+      method: body ? 'POST' : 'GET',
+      headers: body ? { 'x-goog-api-key': key, 'Content-Type': 'application/json' } : { 'x-goog-api-key': key },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ctrl.signal,
+    });
+    let data = null;
+    try { data = await res.json(); } catch (e) { if (ctrl.signal.aborted) throw e; }
+    if (!res.ok) throw geminiError(res.status, data);
+    return data;
+  } catch (e) {
+    if (e instanceof AiError) throw e;
+    if (ctrl.signal.aborted) {
+      throw ctrl.signal.reason === 'cancel'
+        ? new AiError('Abgebrochen.', { aborted: true })
+        : new AiError('Die KI hat zu lange gebraucht. Bitte nochmal versuchen.');
+    }
+    throw new AiError(navigator.onLine
+      ? 'Google Gemini ist nicht erreichbar. Bitte später nochmal versuchen.'
+      : 'Keine Internetverbindung. Für die KI brauchst du Internet.');
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onCancel);
+  }
+}
+
+/** Stabile Flash-Modelle (keine Preview-, Audio- oder Bildmodelle), bestes zuerst. */
+async function geminiListModels(key) {
+  const data = await geminiFetch('models?pageSize=1000', { key, timeoutMs: 15000 });
+  const ids = (data?.models || [])
+    .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map(m => String(m.name || '').replace(/^models\//, ''))
+    .filter(id => /^gemini-\d+(?:\.\d+)?-flash(?:-lite)?$/.test(id));
+  const rank = id => (id.endsWith('-lite') ? 0 : 1000) + parseFloat(id.match(/^gemini-([\d.]+)/)[1]);
+  return [...new Set(ids)].sort((a, b) => rank(b) - rank(a));
+}
+
+async function currentAiModel(key) {
+  const stored = readLocal(AI_MODEL_STORAGE);
+  if (stored) return stored;
+  try {
+    aiModels = await geminiListModels(key);
+  } catch (e) {
+    if (e.badKey || e.aborted) throw e;
+    return AI_FALLBACK_MODEL; // Liste nicht ladbar: bewährtes Modell versuchen
+  }
+  const model = aiModels[0] || AI_FALLBACK_MODEL;
+  writeLocal(AI_MODEL_STORAGE, model);
+  return model;
+}
+
+function todaysRest() {
+  const key = today();
+  const totals = sumEntries(state.diary[key] || []);
+  const goals = dayGoals(key);
+  return Object.fromEntries(NUTRIENTS.map(n => [n.key, Math.max(0, goals[n.key] - totals[n.key])]));
+}
+
+const AI_TAGS_STORAGE = 'kalorienTracker.aiTags'; // zuletzt gewählte Eigenschaften, z. B. wer immer vegan kocht
+let aiTags = null; // wird beim ersten Öffnen aus dem Speicher geladen
+
+function currentAiTags() {
+  if (!aiTags) {
+    try { aiTags = normalizeTags(JSON.parse(readLocal(AI_TAGS_STORAGE) || '[]')); } catch { aiTags = []; }
+  }
+  return aiTags;
+}
+
+function buildAiUserPrompt(wish, servings, useBudget, tags = []) {
+  const lines = [
+    `Wunsch: ${wish || 'Überrasche mich mit einem ausgewogenen, einfachen Gericht.'}`,
+    `Portionen: ${servings}`,
+  ];
+  const rules = tags
+    .filter(key => !(key === 'vegetarian' && tags.includes('vegan'))) // vegan ist strenger
+    .map(key => `- ${TAG[key].prompt}`);
+  if (rules.length) lines.push(`Das Rezept MUSS diese Anforderungen erfüllen:\n${rules.join('\n')}`);
+  if (state.dislikes.length) {
+    lines.push(`Diese Zutaten mag ich nicht. Verwende sie auf keinen Fall, auch nicht in anderer Form oder als Unterart: ${state.dislikes.map(d => d.name).join(', ')}`);
+  }
+  if (useBudget) {
+    const rest = todaysRest();
+    lines.push(rest.kcal < 150
+      ? 'Mein Kalorienbudget für heute ist fast aufgebraucht. Eine Portion soll sehr leicht sein (unter 150 kcal).'
+      : `Mein Restbudget für heute: ${fmt(rest.kcal)} kcal, ${fmt(rest.carbs)} g Kohlenhydrate, ${fmt(rest.fat)} g Fett. `
+        + `Mir fehlen noch ${fmt(rest.protein)} g Eiweiß und ${fmt(rest.fiber)} g Ballaststoffe. `
+        + 'EINE Portion soll in dieses Budget passen und möglichst viel vom fehlenden Eiweiß liefern.');
+  }
+  return lines.join('\n');
+}
+
+/** Textteile der ersten Antwort (ohne Denk-Zusammenfassungen). */
+function geminiText(data) {
+  const candidate = data?.candidates?.[0];
+  if (!candidate) {
+    throw new AiError(data?.promptFeedback?.blockReason
+      ? 'Google hat die Anfrage abgelehnt. Formuliere deinen Wunsch bitte anders.'
+      : 'Die KI hat keine Antwort geliefert. Bitte nochmal versuchen.');
+  }
+  const text = (candidate.content?.parts || [])
+    .filter(p => !p.thought && typeof p.text === 'string')
+    .map(p => p.text)
+    .join('');
+  if (candidate.finishReason === 'MAX_TOKENS') {
+    throw new AiError('Die Antwort der KI wurde abgeschnitten. Bitte nochmal versuchen, eventuell mit einem einfacheren Gericht.');
+  }
+  if (!text.trim()) {
+    throw new AiError(candidate.finishReason && candidate.finishReason !== 'STOP'
+      ? 'Google hat die Antwort zurückgehalten. Formuliere deinen Wunsch bitte anders.'
+      : 'Die KI hat keine Antwort geliefert. Bitte nochmal versuchen.');
+  }
+  return text;
+}
+
+/** KI-Antwort → Rezept-Entwurf. Fehlende Nährwerte bleiben null („Nährwerte suchen“ im Editor). */
+// ---------- Zutat im KI-Entwurf ersetzen oder rausnehmen ----------
+
+const AI_SWAP_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    name: { type: 'STRING' },
+    ersatz: { type: 'ARRAY', items: AI_SCHEMA.properties.zutaten.items },
+    zubereitung: { type: 'ARRAY', items: { type: 'STRING' } },
+    hinweis: { type: 'STRING' },
+  },
+  required: ['name', 'ersatz', 'zubereitung', 'hinweis'],
+  propertyOrdering: ['name', 'ersatz', 'zubereitung', 'hinweis'],
+};
+
+const AI_SWAP_PROMPT = `Du bist Koch und Ernährungsberater und passt ein bestehendes Rezept an. Ändere nur, was für die Anpassung nötig ist.
+
+Antworte im vorgegebenen JSON-Schema:
+- "name": Rezeptname, nur ändern, wenn die bisherige Zutat im Namen vorkam.
+- "ersatz": die neue(n) Zutat(en) anstelle der betroffenen Zutat, mit Menge für ALLE Portionen. Beim Rausnehmen eine leere Liste.
+  - "menge_g": Gramm im abgewogenen Zustand (roh bzw. trocken; Flüssigkeiten 1 ml = 1 g).
+  - Nährwerte pro 100 g der Zutat in genau diesem Zustand, realistische Durchschnittswerte. Kohlenhydrate ohne Ballaststoffe. kcal ≈ 4 × Eiweiß + 4 × Kohlenhydrate + 9 × Fett + 2 × Ballaststoffe.
+- "zubereitung": die vollständigen Arbeitsschritte, angepasst an die Änderung, ohne Nummerierung.
+- "hinweis": ein kurzer Satz, was sich geändert hat (z. B. geänderte Garzeit).`;
+
+function aiSwapPanel(i) {
+  const busy = Boolean(swap.abort);
+  return `
+    <li class="ing-edit ai-swap" data-id="${esc(i.id)}">
+      <p><b>✨ „${esc(i.name)}“ mit KI anpassen</b></p>
+      <label class="field">Ersetzen durch (leer lassen: die KI schlägt etwas Passendes vor)
+        <input type="text" data-swap-input value="${esc(swap.wish)}" placeholder="z. B. Hafersahne" autocomplete="off" ${busy ? 'disabled' : ''}>
+      </label>
+      <div class="form-actions">
+        <button type="button" class="btn small primary" data-swap-replace ${busy ? 'disabled' : ''}>Ersetzen</button>
+        <button type="button" class="btn small" data-swap-remove ${busy ? 'disabled' : ''}>Komplett rausnehmen</button>
+        <button type="button" class="btn small" data-swap-cancel>${busy ? 'Abbrechen' : 'Schließen'}</button>
+      </div>
+      ${swap.status ? `<p class="status${swap.isError ? ' error' : ''}">${esc(swap.status)}</p>` : ''}
+    </li>`;
+}
+
+function buildSwapPrompt(recipe, target, mode, wish) {
+  const lines = [
+    `Rezept: ${recipe.name || 'ohne Namen'} (${recipe.servings} ${recipe.servings === 1 ? 'Portion' : 'Portionen'})`,
+    'Zutaten:',
+    ...recipe.ingredients.map(i => `- ${fmt(i.grams, 1)} g ${i.name}`),
+    'Zubereitung:',
+    ...instructionSteps(recipe.instructions).map(step => `- ${step}`),
+    '',
+    mode === 'remove'
+      ? `Anpassung: Nimm „${target.name}“ komplett aus dem Rezept. Keine Ersatz-Zutat.`
+      : wish
+        ? `Anpassung: Ersetze „${fmt(target.grams, 1)} g ${target.name}“ durch ${wish}. Wähle eine passende Menge.`
+        : `Anpassung: Ersetze „${fmt(target.grams, 1)} g ${target.name}“ durch die passendste Alternative mit ähnlicher Funktion im Rezept.`,
+  ];
+  const rules = recipe.tags
+    .filter(key => !(key === 'vegetarian' && recipe.tags.includes('vegan')))
+    .map(key => `- ${TAG[key].prompt}`);
+  if (rules.length) lines.push(`Das Rezept muss weiterhin diese Anforderungen erfüllen:\n${rules.join('\n')}`);
+  if (state.dislikes.length) lines.push(`Verwende auf keinen Fall: ${state.dislikes.map(d => d.name).join(', ')}`);
+  return lines.join('\n');
+}
+
+async function runIngredientSwap(mode) {
+  if (!swap || swap.abort || !recipeDraft) return;
+  const target = recipeDraft.ingredients.find(i => i.id === swap.ingredientId);
+  const key = readLocal(AI_KEY_STORAGE);
+  if (!target || !key) return;
+  const wish = swap.wish.trim();
+  const current = swap;
+  current.abort = new AbortController();
+  current.isError = false;
+  const started = Date.now();
+  const statusText = () => `Die KI passt das Rezept an … ${Math.round((Date.now() - started) / 1000)} s`;
+  current.status = statusText();
+  renderDraft(); // Knöpfe sperren, Status anzeigen
+  const tick = () => {
+    current.status = statusText();
+    const status = $('#recipeIngredients .ai-swap .status');
+    if (status) status.textContent = current.status;
+  };
+  const timer = setInterval(tick, 1000);
+  const before = structuredClone(recipeDraft);
+
+  try {
+    const model = await currentAiModel(key);
+    const data = await geminiFetch(`models/${model}:generateContent`, {
+      key,
+      signal: current.abort.signal,
+      body: {
+        systemInstruction: { parts: [{ text: AI_SWAP_PROMPT }] },
+        contents: [{ role: 'user', parts: [{ text: buildSwapPrompt(recipeDraft, target, mode, wish) }] }],
+        generationConfig: { responseMimeType: 'application/json', responseSchema: AI_SWAP_SCHEMA },
+      },
+    });
+    const answer = parseAiJson(geminiText(data));
+    if (swap !== current || !recipeDraft) return; // Editor wurde inzwischen geschlossen oder gewechselt
+    const index = recipeDraft.ingredients.findIndex(i => i.id === target.id);
+    if (index < 0) throw new AiError('Die Zutat wurde inzwischen gelöscht.');
+    const replacements = mode === 'remove' ? [] : parseAiIngredients(answer?.ersatz);
+    if (mode === 'replace' && !replacements.length) {
+      throw new AiError('Die KI hat keinen Ersatz geliefert. Bitte nochmal versuchen oder einen Ersatz vorgeben.');
+    }
+    const steps = instructionSteps((Array.isArray(answer?.zubereitung) ? answer.zubereitung.map(String) : []).join('\n'));
+
+    recipeDraft.ingredients.splice(index, 1, ...replacements);
+    if (steps.length) recipeDraft.instructions = steps.join('\n');
+    const newName = String(answer?.name ?? '').trim();
+    if (newName) recipeDraft.name = newName;
+    swapResult = {
+      text: mode === 'remove'
+        ? `„${target.name}“ rausgenommen, Zubereitung angepasst.`
+        : `„${target.name}“ ersetzt durch ${replacements.map(r => `${fmt(r.grams)} g ${r.name}`).join(' und ')}.`,
+      hint: String(answer?.hinweis ?? '').trim(),
+      undo: before,
+    };
+    swap = null;
+    $('#recipeName').value = recipeDraft.name;
+    $('#recipeInstructions').value = recipeDraft.instructions;
+    renderDraft();
+  } catch (e) {
+    if (swap !== current) return;
+    current.status = e.aborted ? '' : e.message;
+    current.isError = !e.aborted;
+    current.abort = null;
+    if (e.badModel) writeLocal(AI_MODEL_STORAGE, '');
+    if (e.aborted) swap = null;
+    renderDraft();
+  } finally {
+    clearInterval(timer);
+    if (swap === current) current.abort = null;
+  }
+}
+
+function parseAiJson(text) {
+  try {
+    return JSON.parse(text.trim().replace(/^```(?:json)?\s*|\s*```$/g, ''));
+  } catch {
+    throw new AiError('Die KI hat keine gültige Antwort geliefert. Bitte nochmal versuchen.');
+  }
+}
+
+/** Zutaten im KI-Schema (deutsche Feldnamen) → Entwurfs-Zutaten mit Marke „KI-Schätzung“. */
+function parseAiIngredients(list) {
+  const ingredients = [];
+  for (const z of Array.isArray(list) ? list : []) {
+    const name = String(z?.name ?? '').trim();
+    const grams = toNum(z?.menge_g);
+    if (!name || !(grams > 0)) continue;
+    const per100 = {};
+    for (const n of NUTRIENTS) {
+      const v = AI_FIELDS[n.key] ? toNum(z[AI_FIELDS[n.key]]) : null;
+      per100[n.key] = v !== null && v >= 0 ? round(v, 1) : null;
+    }
+    ingredients.push({ id: uid(), name, brand: per100.kcal === null ? '' : AI_BRAND, code: '', grams: round(grams, 1), per100 });
+  }
+  return ingredients;
+}
+
+function parseAiRecipe(text, servings) {
+  const data = parseAiJson(text);
+  const ingredients = parseAiIngredients(data?.zutaten);
+  if (!ingredients.length) throw new AiError('Die KI hat keine verwertbaren Zutaten geliefert. Bitte nochmal versuchen.');
+  const steps = Array.isArray(data.zubereitung) ? data.zubereitung.map(String) : [];
+  return {
+    id: `rec-${uid()}`,
+    name: String(data.name || '').trim() || 'KI-Rezept',
+    servings,
+    totalWeight: null,
+    ingredients,
+    instructions: instructionSteps(steps.join('\n')).join('\n'),
+    sourceUrl: '',
+    updated: 0,
+  };
+}
+
+function renderAiCard() {
+  $('#aiTags').innerHTML = tagChips(currentAiTags(), 'ai-tag');
+  $('#aiDislikeHint').textContent = state.dislikes.length
+    ? `👎 Wird automatisch weggelassen: ${state.dislikes.map(d => d.name).join(', ')} (Liste „Mag ich nicht“ unten)`
+    : '';
+  $('#aiDislikeHint').hidden = !state.dislikes.length;
+  const hasKey = Boolean(readLocal(AI_KEY_STORAGE));
+  $('#aiSetup').hidden = hasKey;
+  $('#aiMain').hidden = !hasKey;
+  if (!hasKey) return;
+  const rest = todaysRest();
+  $('#aiBudgetLabel').textContent = `An meinem heutigen Restbudget ausrichten (noch ${fmt(rest.kcal)} kcal, ${fmt(rest.protein)} g Eiweiß fehlen)`;
+  renderModelSelect();
+}
+
+function renderModelSelect() {
+  const current = readLocal(AI_MODEL_STORAGE);
+  const ids = [...(aiModels || [])];
+  if (current && !ids.includes(current)) ids.unshift(current);
+  $('#aiModel').innerHTML = [
+    `<option value="">Automatisch (${esc(aiModels?.[0] || current || 'bestes Flash-Modell')})</option>`,
+    ...ids.map(id => `<option value="${esc(id)}">${esc(id)}</option>`),
+  ].join('');
+  $('#aiModel').value = aiModels && current === aiModels[0] ? '' : current;
+}
+
+function setAiStatus(text, isError = false) {
+  const el = $('#aiStatus');
+  el.textContent = text;
+  el.classList.toggle('error', isError);
+}
+
+async function saveAiKey() {
+  const input = $('#aiKeyInput');
+  const msg = $('#aiKeyMsg');
+  const key = input.value.trim().replace(/\s+/g, '');
+  if (!key) return setMsg(msg, 'Bitte zuerst den API-Schlüssel einfügen.', true);
+  $('#aiKeySave').disabled = true;
+  setMsg(msg, 'Schlüssel wird geprüft …');
+  try {
+    aiModels = await geminiListModels(key); // prüft den Schlüssel und lädt die Modelle
+    if (!writeLocal(AI_KEY_STORAGE, key)) return setMsg(msg, 'Der Schlüssel konnte in diesem Browser nicht gespeichert werden.', true);
+    writeLocal(AI_MODEL_STORAGE, aiModels[0] || AI_FALLBACK_MODEL);
+    input.value = '';
+    setMsg(msg, '');
+    renderAiCard();
+    showToast('KI ist eingerichtet ✓');
+    $('#aiPrompt').focus();
+  } catch (e) {
+    setMsg(msg, e.message, true);
+  } finally {
+    $('#aiKeySave').disabled = false;
+  }
+}
+
+async function generateAiRecipe() {
+  if (aiAbort) return;
+  const key = readLocal(AI_KEY_STORAGE);
+  if (!key) return renderAiCard();
+  const servings = toNum($('#aiServings').value);
+  if (!Number.isInteger(servings) || servings < 1 || servings > 20) {
+    return setAiStatus('Bitte eine Portionenzahl zwischen 1 und 20 eingeben.', true);
+  }
+
+  aiAbort = new AbortController();
+  $('#aiGenerate').disabled = true;
+  $('#aiCancel').hidden = false;
+  const started = Date.now();
+  const tick = () => setAiStatus(`Die KI erstellt dein Rezept … ${Math.round((Date.now() - started) / 1000)} s (meist 10 bis 40 Sekunden)`);
+  tick();
+  const timer = setInterval(tick, 1000);
+
+  try {
+    const model = await currentAiModel(key);
+    const data = await geminiFetch(`models/${model}:generateContent`, {
+      key,
+      signal: aiAbort.signal,
+      body: {
+        systemInstruction: { parts: [{ text: AI_SYSTEM_PROMPT }] },
+        contents: [{ role: 'user', parts: [{ text: buildAiUserPrompt($('#aiPrompt').value.trim(), servings, $('#aiUseBudget').checked, currentAiTags()) }] }],
+        generationConfig: { responseMimeType: 'application/json', responseSchema: AI_SCHEMA },
+      },
+    });
+    const recipe = parseAiRecipe(geminiText(data), servings);
+    recipe.tags = [...currentAiTags()]; // Editor prüft danach, ob die Nährwerte dazu passen
+    setAiStatus('');
+    aiOpen = false;
+    startRecipeEdit(recipe, { fromAi: true });
+    if (currentView !== 'recipes') showToast('Dein KI-Rezept ist fertig (Reiter „Rezepte“).');
+  } catch (e) {
+    if (e.badModel) writeLocal(AI_MODEL_STORAGE, ''); // beim nächsten Versuch neu auswählen
+    setAiStatus(e.badKey ? `${e.message} Unter „KI-Einstellungen“ kannst du den Schlüssel entfernen und neu eintragen.` : e.message, !e.aborted);
+  } finally {
+    clearInterval(timer);
+    aiAbort = null;
+    $('#aiGenerate').disabled = false;
+    $('#aiCancel').hidden = true;
+  }
+}
+
+function bindAiEvents() {
+  $('#aiTags').addEventListener('click', ev => {
+    const chip = ev.target.closest('[data-ai-tag]');
+    if (!chip) return;
+    aiTags = toggleTag(currentAiTags(), chip.dataset.aiTag);
+    writeLocal(AI_TAGS_STORAGE, JSON.stringify(aiTags));
+    $('#aiTags').innerHTML = tagChips(aiTags, 'ai-tag');
+  });
+  $('#aiOpenBtn').addEventListener('click', () => {
+    aiOpen = true;
+    importOpen = false;
+    renderRecipes();
+    (readLocal(AI_KEY_STORAGE) ? $('#aiPrompt') : $('#aiKeyInput')).focus();
+  });
+  $('#importOpenBtn').addEventListener('click', () => {
+    aiOpen = false; // immer nur eine der beiden Karten offen
+  });
+  $('#aiClose').addEventListener('click', () => {
+    aiAbort?.abort();
+    aiOpen = false;
+    renderRecipes();
+  });
+
+  $('#aiKeySave').addEventListener('click', saveAiKey);
+  $('#aiKeyInput').addEventListener('keydown', ev => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault(); // nicht das Formular (Rezept erstellen) absenden
+    saveAiKey();
+  });
+  $('#aiKeyRemove').addEventListener('click', () => {
+    if (!confirm('API-Schlüssel von diesem Gerät entfernen?')) return;
+    writeLocal(AI_KEY_STORAGE, '');
+    writeLocal(AI_MODEL_STORAGE, '');
+    aiModels = null;
+    $('#aiSettings').open = false;
+    renderAiCard();
+  });
+
+  $('#aiSettings').addEventListener('toggle', async () => {
+    if (!$('#aiSettings').open || aiModels) return;
+    try {
+      aiModels = await geminiListModels(readLocal(AI_KEY_STORAGE));
+      renderModelSelect();
+    } catch { /* Auswahl zeigt dann nur das aktuelle Modell */ }
+  });
+  $('#aiModel').addEventListener('change', ev => {
+    writeLocal(AI_MODEL_STORAGE, ev.target.value || aiModels?.[0] || '');
+  });
+
+  $('#aiCard').addEventListener('submit', ev => {
+    ev.preventDefault();
+    generateAiRecipe();
+  });
+  $('#aiCancel').addEventListener('click', () => aiAbort?.abort());
+}
+
+// =====================================================================
+// Ansicht: Einkaufsliste
+// =====================================================================
+
+const WATER_PATTERN = /^(?:wasser|leitungswasser|eiswasser|heißes wasser|kaltes wasser)\b/i;
+
+// ---------- Vorrat („Zu Hause vorrätig“) ----------
+
+/** Wortformen für einen einfachen Singular/Plural-Abgleich („Ei“ ↔ „Eier“, „Zwiebel“ ↔ „Zwiebeln“). */
+function wordForms(word) {
+  if (word.length < 3) return [word, `${word}er`]; // „Ei“ → „Eier“, aber nicht „Eis“ oder „Ein“
+  return [word, `${word}n`, `${word}en`, `${word}er`, `${word}e`, `${word}s`];
+}
+
+// Oberbegriffe, die konkrete Zutaten einschließen („Pilze“ passt zu „Champignons“)
+const INGREDIENT_GROUPS = [
+  { words: ['pilz'], pattern: /champignon|pfifferling|steinpilz|shiitake|austernpilz|kräuterseitling|morchel|trüffel/i },
+  { words: ['fisch'], pattern: /lachs|thunfisch|kabeljau|forelle|hering|makrele|sardine|sardelle|seelachs|dorsch|scholle|zander|pangasius|anchovi/i },
+  { words: ['meeresfrüchte', 'meeresfrucht'], pattern: /garnele|shrimp|krabbe|muschel|tintenfisch|calamar|oktopus|hummer|scampi|krebs/i },
+  { words: ['nuss', 'nüsse'], pattern: /nuss|nüsse|mandel|cashew|pistazie|pekan|macadamia/i },
+  { words: ['innereien'], pattern: /leber|niere|kutteln|bries/i },
+];
+
+function nameKey(name) {
+  return shoppingKey(name).replace(/\(.*?\)/g, ' ').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Passt ein Listeneintrag (Vorrat, „Mag ich nicht“) zu einer Zutat? Gleiches Wort (auch Plural), bei mehrteiligen
+ * Einträgen die ganze Wortfolge, bei zusammengesetzten Wörtern das Wortende („Öl“ → „Olivenöl“, „Kohl“ → „Rosenkohl“)
+ * oder ein Oberbegriff aus INGREDIENT_GROUPS.
+ */
+function nameMatches(ingredientName, entryName, { prefix = false } = {}) {
+  const key = nameKey(ingredientName);
+  const pk = nameKey(entryName);
+  if (!key || !pk) return false;
+  const words = key.split(' ');
+  const group = INGREDIENT_GROUPS.find(g => g.words.some(w => w === pk || wordForms(w).includes(pk)));
+  if (group && group.pattern.test(key)) return true;
+  if (pk.includes(' ')) return ` ${key} `.includes(` ${pk} `);
+  // Wortende: bei kurzen Einträgen nur die Grundform („Öl“ → „Olivenöl“, aber „Ei“ nicht → „Rotwein“)
+  const endings = pk.length >= 3 ? wordForms(pk) : [pk];
+  return words.some(w => wordForms(pk).includes(w)
+    || wordForms(w).includes(pk)
+    || endings.some(form => w.length > form.length && w.endsWith(form))
+    // Wortanfang („Fisch“ → „Fischsauce“) nur auf Wunsch: beim Vorrat wäre „Tomaten“ ≠ „Tomatenmark“
+    || (prefix && [pk, pk.replace(/(?:en|er|n|e|s)$/, '')] // auch Einzahl vorne: „Pilze“ → „Pilzfond“
+      .some(stem => stem.length >= 4 && w.length > stem.length && w.startsWith(stem))));
+}
+
+function pantryMatches(name) {
+  return state.pantry.filter(p => nameMatches(name, p.name));
+}
+
+function dislikeMatches(name) {
+  return state.dislikes.filter(d => nameMatches(name, d.name, { prefix: true }));
+}
+
+function renderDislikes() {
+  $('#dislikeList').innerHTML = state.dislikes.length
+    ? state.dislikes.map(d => `
+      <span class="pantry-chip" data-id="${esc(d.id)}">${esc(d.name)}
+        <button type="button" class="icon-btn" data-dislike-del aria-label="${esc(d.name)} aus „Mag ich nicht“ entfernen" title="Entfernen">✕</button>
+      </span>`).join('')
+    : '<p class="muted">Noch nichts eingetragen.</p>';
+}
+
+function bindDislikeEvents() {
+  $('#dislikeForm').addEventListener('submit', ev => {
+    ev.preventDefault();
+    const input = $('#dislikeInput');
+    // Mehrere auf einmal möglich: „Pilze, Koriander“
+    const names = input.value.split(/[,;\n]/).map(s => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
+    if (!names.length) return;
+    let added = 0;
+    for (const name of names) {
+      if (state.dislikes.some(d => d.name.toLowerCase() === name.toLowerCase())) continue;
+      state.dislikes.push({ id: uid(), name });
+      added++;
+    }
+    if (!added) {
+      showToast('Steht schon auf der Liste.');
+    } else {
+      state.dislikes.sort((a, b) => a.name.localeCompare(b.name, 'de'));
+      saveState();
+    }
+    input.value = '';
+    renderRecipes(); // Hinweise an den Rezepten aktualisieren
+    $('#dislikeInput').focus();
+  });
+
+  $('#dislikeList').addEventListener('click', ev => {
+    if (!ev.target.closest('[data-dislike-del]')) return;
+    const id = ev.target.closest('.pantry-chip').dataset.id;
+    state.dislikes = state.dislikes.filter(d => d.id !== id);
+    saveState();
+    renderRecipes();
+  });
+}
+
+/** Nicht gemochte Zutaten eines Rezepts: [{ ingredient, entries }] */
+function recipeDislikes(recipe) {
+  if (!state.dislikes.length) return [];
+  return recipe.ingredients
+    .map(i => ({ ingredient: i.name, entries: dislikeMatches(i.name).map(d => d.name) }))
+    .filter(x => x.entries.length);
+}
+
+/** Warum eine Rezeptzutat nicht vorausgewählt ist (oder '' wenn sie auf die Liste soll). */
+function shopSkipReason(name) {
+  if (pantryMatches(name).length) return 'vorrätig';
+  if (WATER_PATTERN.test(name)) return 'aus der Leitung';
+  if (SPICES.test(name)) return 'Gewürz';
+  return '';
+}
+
+function addToPantry(name) {
+  const clean = cleanLine(name).replace(/\(.*?\)/g, '').replace(/\s+/g, ' ').trim();
+  if (!clean || state.pantry.some(p => p.name.toLowerCase() === clean.toLowerCase())) return false;
+  state.pantry.push({ id: uid(), name: clean });
+  state.pantry.sort((a, b) => a.name.localeCompare(b.name, 'de'));
+  saveState();
+  return true;
+}
+
+function removeFromPantry(name) {
+  const ids = new Set(pantryMatches(name).map(p => p.id));
+  state.pantry = state.pantry.filter(p => !ids.has(p.id));
+  saveState();
+}
+
+function updateShopSubmit(form) {
+  const count = $$('input[name="ing"]', form).filter(cb => cb.checked).length;
+  const btn = $('[data-shop-submit]', form);
+  btn.disabled = !count;
+  btn.textContent = count ? `${count} ${count === 1 ? 'Zutat' : 'Zutaten'} auf die Einkaufsliste` : 'Alles vorrätig';
+}
+
+function renderPantry() {
+  $('#pantryList').innerHTML = state.pantry.length
+    ? state.pantry.map(p => `
+      <span class="pantry-chip" data-id="${esc(p.id)}">${esc(p.name)}
+        <button type="button" class="icon-btn" data-pantry-del aria-label="${esc(p.name)} aus dem Vorrat entfernen" title="Entfernen">✕</button>
+      </span>`).join('')
+    : '<p class="muted">Noch nichts eingetragen.</p>';
+}
+
+function bindPantryEvents() {
+  $('#pantryForm').addEventListener('submit', ev => {
+    ev.preventDefault();
+    const input = $('#pantryInput');
+    // Mehrere auf einmal möglich: „Öl, Reis, Nudeln“
+    const names = input.value.split(/[,;\n]/).map(s => s.trim()).filter(Boolean);
+    if (!names.length) return;
+    const added = names.filter(addToPantry).length;
+    if (!added) showToast('Steht schon im Vorrat.');
+    input.value = '';
+    renderPantry();
+    input.focus();
+  });
+  $('#pantryList').addEventListener('click', ev => {
+    if (!ev.target.closest('[data-pantry-del]')) return;
+    const id = ev.target.closest('.pantry-chip').dataset.id;
+    state.pantry = state.pantry.filter(p => p.id !== id);
+    saveState();
+    renderPantry();
+  });
+}
+
+function fmtShopGrams(g) {
+  if (g >= 1000) return `${fmt(g / 1000, 2)} kg`;
+  return g < 10 ? `${fmt(g, 1)} g` : `${fmt(Math.ceil(g))} g`; // aufrunden: lieber etwas mehr kaufen
+}
+
+/**
+ * Schlüssel für die gemerkte Markt-Zuordnung: „2 Eier“ (von Hand) und „Eier“ (aus einem Rezept)
+ * sollen im selben Markt landen.
+ */
+function shoppingKey(name) {
+  const line = cleanLine(name);
+  const parsed = parseIngredientLine(line);
+  return (parsed && parsed.hadAmount ? parsed.name : line).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/** Fügt einen Eintrag hinzu oder rechnet ihn mit einem offenen gleichnamigen Eintrag zusammen. */
+function addShoppingItem({ name, grams = null, source = '' }) {
+  const key = name.trim().toLowerCase();
+  const existing = state.shopping.find(i => !i.checked && i.name.toLowerCase() === key && (i.grams === null) === (grams === null));
+  if (existing) {
+    if (grams !== null) existing.grams = round(existing.grams + grams, 1);
+    if (source && !existing.sources.includes(source)) existing.sources.push(source);
+    return 'merged';
+  }
+  const shopId = state.shopAssignments[shoppingKey(name)] || null; // beim letzten Mal gewählten Markt vorschlagen
+  state.shopping.push({
+    id: uid(), name: name.trim(), grams: grams === null ? null : round(grams, 1),
+    sources: source ? [source] : [], checked: false, shopId,
+  });
+  return 'added';
+}
+
+/** `selected`: Indizes der Zutaten, die auf die Liste sollen (Rest ist vorrätig oder abgewählt). */
+function addRecipeToShopping(recipe, portions, selected) {
+  const factor = portions / (recipe.servings > 0 ? recipe.servings : 1);
+  let added = 0;
+  let merged = 0;
+  recipe.ingredients.forEach((ing, index) => {
+    if (!selected.has(index)) return;
+    if (addShoppingItem({ name: ing.name, grams: ing.grams * factor, source: recipe.name }) === 'merged') merged++;
+    else added++;
+  });
+  if (!added && !merged) return;
+  saveState();
+  const count = added + merged;
+  const skipped = recipe.ingredients.length - count;
+  showToast(`${count} ${count === 1 ? 'Zutat' : 'Zutaten'} auf der Einkaufsliste${
+    merged ? `, ${merged} mit vorhandenen zusammengerechnet` : ''}${skipped ? `, ${skipped} weggelassen` : ''}`);
+}
+
+/** Offene Einträge nach Markt (in der Reihenfolge der gespeicherten Märkte), zuletzt die ohne Markt. */
+function shoppingGroups(items) {
+  const groups = state.shops
+    .map(shop => ({ shop, items: items.filter(i => i.shopId === shop.id) }))
+    .filter(g => g.items.length);
+  const withoutShop = items.filter(i => !i.shopId);
+  if (withoutShop.length) groups.push({ shop: null, items: withoutShop });
+  return groups;
+}
+
+function renderShopping() {
+  const open = state.shopping.filter(i => !i.checked);
+  const done = state.shopping.filter(i => i.checked);
+  const shopById = Object.fromEntries(state.shops.map(shop => [shop.id, shop]));
+  const grouped = open.some(i => i.shopId);
+
+  const row = i => {
+    const shop = shopById[i.shopId];
+    let chip = '';
+    if (!i.checked) {
+      chip = shop && grouped
+        ? `<button type="button" class="shop-chip set" data-shop-pick aria-label="Markt ändern" title="Markt ändern">🏪</button>`
+        : `<button type="button" class="shop-chip${shop ? ' set' : ''}" data-shop-pick title="Markt wählen">🏪 ${shop ? esc(shop.name) : 'Markt'}</button>`;
+    }
+    return `
+      <li class="shop-item${i.checked ? ' done' : ''}" data-id="${esc(i.id)}">
+        <label class="shop-check">
+          <input type="checkbox" data-shop-check ${i.checked ? 'checked' : ''}>
+          <span class="shop-text">
+            <span class="shop-name">${i.grams !== null ? `<span class="shop-amount">${fmtShopGrams(i.grams)}</span>` : ''}${esc(i.name)}</span>
+            ${i.sources.length ? `<span class="shop-source">für ${i.sources.map(esc).join(', ')}</span>` : ''}
+          </span>
+        </label>
+        ${chip}
+        <button type="button" class="icon-btn del" data-shop-del aria-label="Eintrag entfernen" title="Entfernen">✕</button>
+      </li>`;
+  };
+
+  const openHtml = grouped
+    ? shoppingGroups(open).map(g => `
+        <li class="shop-group">${g.shop
+          ? `🏪 ${esc(g.shop.name)}${g.shop.detail ? ` <span class="muted">${esc(g.shop.detail)}</span>` : ''}`
+          : 'Ohne Markt'}</li>
+        ${g.items.map(row).join('')}`)
+    : open.map(row);
+
+  $('#shopList').innerHTML = state.shopping.length
+    ? [
+      ...openHtml,
+      done.length ? `<li class="shop-divider">Erledigt (${done.length})</li>` : '',
+      ...done.map(row),
+    ].join('')
+    : '<li class="empty">Die Einkaufsliste ist leer.</li>';
+  $('#shopActions').hidden = !state.shopping.length;
+  $('#shopClearDone').hidden = !done.length;
+  $('#shopShare').hidden = !open.length;
+  renderPantry();
+}
+
+function shoppingText() {
+  const open = state.shopping.filter(i => !i.checked);
+  const line = i => `- ${i.grams !== null ? `${fmtShopGrams(i.grams)} ` : ''}${i.name}`;
+  if (!open.some(i => i.shopId)) return `Einkaufsliste\n${open.map(line).join('\n')}`;
+  const sections = shoppingGroups(open)
+    .map(g => `${g.shop ? g.shop.name : 'Ohne Markt'}:\n${g.items.map(line).join('\n')}`);
+  return `Einkaufsliste\n\n${sections.join('\n\n')}`;
+}
+
+// ---------- Markt wählen ----------
+
+const NEARBY_RADIUS_M = 3000;
+// Suchbegriffe für Nominatim und die dazu erwarteten OpenStreetMap-Typen (im Browser getestet)
+const NEARBY_QUERIES = [
+  { q: 'supermarket', type: 'supermarket', label: 'Supermarkt' },
+  { q: 'chemist', type: 'chemist', label: 'Drogerie' },
+  { q: 'butcher', type: 'butcher', label: 'Metzgerei' },
+  { q: 'bakery', type: 'bakery', label: 'Bäckerei' },
+  { q: 'greengrocer', type: 'greengrocer', label: 'Obst & Gemüse' },
+  { q: 'Getränkemarkt', type: 'beverages', label: 'Getränkemarkt' },
+];
+const NOMINATIM_BASE = 'https://nominatim.openstreetmap.org/search';
+const NOMINATIM_GAP_MS = 1100; // Nutzungsregeln von Nominatim: höchstens eine Anfrage pro Sekunde
+
+const shopDialog = $('#shopPicker');
+let pickerItemId = null;
+let nearby = null; // { label, results: [{ osm, name, type, street, distance }] } – nur für diese Sitzung
+let nearbySeq = 0;
+
+class OsmError extends Error {}
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function nominatim(params) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(`${NOMINATIM_BASE}?${new URLSearchParams({ format: 'jsonv2', 'accept-language': 'de', ...params })}`, { signal: ctrl.signal });
+    if (res.status === 429) throw new OsmError('Zu viele Suchanfragen an OpenStreetMap. Bitte eine Minute warten.');
+    if (!res.ok) throw new OsmError(`OpenStreetMap meldet einen Fehler (${res.status}). Bitte später nochmal versuchen.`);
+    return await res.json();
+  } catch (e) {
+    if (e instanceof OsmError) throw e;
+    if (ctrl.signal.aborted) throw new OsmError('OpenStreetMap antwortet gerade nicht. Bitte später nochmal versuchen.');
+    throw new OsmError(navigator.onLine ? 'OpenStreetMap ist nicht erreichbar.' : 'Keine Internetverbindung.');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function distanceM(lat1, lon1, lat2, lon2) {
+  const rad = x => (x * Math.PI) / 180;
+  const a = Math.sin(rad(lat2 - lat1) / 2) ** 2
+    + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(rad(lon2 - lon1) / 2) ** 2;
+  return 6371000 * 2 * Math.asin(Math.sqrt(a));
+}
+
+function fmtDistance(m) {
+  return m < 1000 ? `${Math.max(10, Math.round(m / 10) * 10)} m` : `${fmt(m / 1000, 1)} km`;
+}
+
+async function geocodeAddress(text) {
+  const [hit] = await nominatim({ q: text, limit: '1', countrycodes: 'de,at,ch' });
+  if (!hit) return null;
+  const label = String(hit.display_name || text).split(',').slice(0, 3).map(s => s.trim()).join(', ');
+  return { label, lat: Number(hit.lat), lon: Number(hit.lon) };
+}
+
+/** Sucht nacheinander (Nominatim erlaubt keine parallelen Anfragen) und meldet Zwischenstände. */
+async function searchNearbyShops({ lat, lon }, onProgress) {
+  const dLat = NEARBY_RADIUS_M / 111320;
+  const dLon = dLat / Math.cos((lat * Math.PI) / 180);
+  const viewbox = `${lon - dLon},${lat + dLat},${lon + dLon},${lat - dLat}`;
+  const found = new Map();
+  let failures = 0;
+  for (const [index, query] of NEARBY_QUERIES.entries()) {
+    if (index) await wait(NOMINATIM_GAP_MS);
+    let hits;
+    try {
+      hits = await nominatim({ q: query.q, viewbox, bounded: '1', limit: '40', addressdetails: '1' });
+    } catch (e) {
+      failures++;
+      if (failures === NEARBY_QUERIES.length || /Zu viele/.test(e.message)) throw e;
+      continue;
+    }
+    for (const hit of hits) {
+      if (hit.category !== 'shop' || hit.type !== query.type) continue;
+      const distance = distanceM(lat, lon, Number(hit.lat), Number(hit.lon));
+      if (distance > NEARBY_RADIUS_M) continue;
+      const address = hit.address || {};
+      const street = [address.road || address.pedestrian, address.house_number].filter(Boolean).join(' ');
+      const name = String(hit.name || '').trim() || query.label;
+      const osm = `${hit.osm_type}/${hit.osm_id}`;
+      const key = `${name.toLowerCase()}|${street.toLowerCase()}`; // gleicher Markt als Punkt und Gebäude eingetragen
+      const existing = found.get(key);
+      if (!existing || distance < existing.distance) found.set(key, { osm, name, type: query.label, street, distance });
+    }
+    onProgress?.([...found.values()].sort((a, b) => a.distance - b.distance), index + 1 < NEARBY_QUERIES.length);
+  }
+  return [...found.values()].sort((a, b) => a.distance - b.distance);
+}
+
+function currentPosition() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new OsmError('Dein Browser kann den Standort nicht bestimmen. Gib stattdessen eine Adresse ein.'));
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      pos => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
+      err => reject(new OsmError(err.code === 1
+        ? 'Der Standortzugriff wurde nicht erlaubt. Erlaube ihn in den Browser-Einstellungen oder gib eine Adresse ein.'
+        : 'Der Standort konnte nicht bestimmt werden. Gib stattdessen eine Adresse ein.')),
+      { timeout: 15000, maximumAge: 5 * 60 * 1000 },
+    );
+  });
+}
+
+function setPickerStatus(text, isError = false) {
+  const el = $('#pickerStatus');
+  el.textContent = text;
+  el.classList.toggle('error', isError);
+}
+
+function pickerItem() {
+  return state.shopping.find(i => i.id === pickerItemId);
+}
+
+function openShopPicker(item) {
+  pickerItemId = item.id;
+  $('#pickerTitle').textContent = `Wo kaufst du „${item.name}“?`;
+  $('#pickerAddress').value = state.shopLocation?.label || '';
+  $('#pickerOwnName').value = '';
+  if (!nearby) setPickerStatus('');
+  renderPicker();
+  shopDialog.showModal();
+  if (!nearby && state.shopLocation) runNearbySearch(state.shopLocation);
+}
+
+function renderPicker() {
+  const item = pickerItem();
+  const current = item?.shopId || null;
+  $('#pickerMineEmpty').hidden = state.shops.length > 0;
+  $('#pickerShops').innerHTML = [
+    ...state.shops.map(shop => `
+      <li class="picker-row">
+        <button type="button" class="result${shop.id === current ? ' current' : ''}" data-pick-shop="${esc(shop.id)}">
+          <span class="result-name">${esc(shop.name)}${shop.id === current ? ' ✓' : ''}</span>
+          ${shop.detail ? `<span class="result-meta">${esc(shop.detail)}</span>` : ''}
+        </button>
+        <button type="button" class="icon-btn del" data-remove-shop="${esc(shop.id)}" aria-label="Markt aus deiner Liste entfernen" title="Aus deinen Märkten entfernen">✕</button>
+      </li>`),
+    state.shops.length ? `
+      <li class="picker-row">
+        <button type="button" class="result${current ? '' : ' current'}" data-pick-shop="">
+          <span class="result-name">Ohne Markt${current ? '' : ' ✓'}</span>
+        </button>
+      </li>` : '',
+  ].join('');
+  renderNearbyList();
+}
+
+function renderNearbyList() {
+  const typeField = $('#pickerTypeField');
+  if (!nearby || !nearby.results.length) {
+    $('#pickerNearby').innerHTML = '';
+    typeField.hidden = true;
+    return;
+  }
+  // Filter nach Art; nur Arten anbieten, die gefunden wurden
+  const select = $('#pickerType');
+  const chosen = select.value;
+  const counts = {};
+  for (const r of nearby.results) counts[r.type] = (counts[r.type] || 0) + 1;
+  select.innerHTML = [`<option value="">Alle (${nearby.results.length})</option>`,
+    ...NEARBY_QUERIES.filter(q => counts[q.label]).map(q => `<option value="${esc(q.label)}">${esc(q.label)} (${counts[q.label]})</option>`),
+  ].join('');
+  select.value = counts[chosen] ? chosen : '';
+  typeField.hidden = false;
+
+  const saved = new Set(state.shops.map(shop => shop.osm).filter(Boolean));
+  const shown = nearby.results
+    .map((r, index) => ({ r, index }))
+    .filter(({ r }) => !select.value || r.type === select.value)
+    .slice(0, 40);
+  $('#pickerNearby').innerHTML = shown.map(({ r, index }) => `
+    <li>
+      <button type="button" class="result" data-nearby="${index}">
+        <span class="result-name">${esc(r.name)}${saved.has(r.osm) ? ' <span class="muted">(gespeichert)</span>' : ''}</span>
+        <span class="result-meta">${esc([r.type, r.street, fmtDistance(r.distance)].filter(Boolean).join(' · '))}</span>
+      </button>
+    </li>`).join('');
+}
+
+async function runNearbySearch(location) {
+  const seq = ++nearbySeq;
+  const buttons = [$('#pickerAddressBtn'), $('#pickerGps')];
+  buttons.forEach(b => { b.disabled = true; });
+  nearby = null;
+  renderNearbyList();
+  setPickerStatus('Suche Märkte in der Nähe …');
+  try {
+    const results = await searchNearbyShops(location, (partial, more) => {
+      if (seq !== nearbySeq) return;
+      nearby = { label: location.label, results: partial };
+      renderNearbyList();
+      if (more) setPickerStatus(`Suche Märkte in der Nähe … (${partial.length} gefunden)`);
+    });
+    if (seq !== nearbySeq) return;
+    nearby = { label: location.label, results };
+    renderNearbyList();
+    setPickerStatus(results.length
+      ? `${results.length} Märkte im Umkreis von ${fmtDistance(NEARBY_RADIUS_M)} um ${location.label}`
+      : `Keine Märkte im Umkreis von ${fmtDistance(NEARBY_RADIUS_M)} gefunden. Trag deinen Markt unten selbst ein.`);
+  } catch (e) {
+    if (seq === nearbySeq) setPickerStatus(e.message, true);
+  } finally {
+    if (seq === nearbySeq) buttons.forEach(b => { b.disabled = false; });
+  }
+}
+
+/** Ordnet den Eintrag (und offene Einträge mit derselben Zutat) einem Markt zu und merkt sich das. */
+function assignShop(shopId) {
+  const item = pickerItem();
+  if (!item) return;
+  const key = shoppingKey(item.name);
+  for (const i of state.shopping) {
+    if (i.id === item.id || (!i.checked && shoppingKey(i.name) === key)) i.shopId = shopId || null;
+  }
+  if (shopId) state.shopAssignments[key] = shopId;
+  else delete state.shopAssignments[key];
+  saveState();
+  shopDialog.close();
+  renderShopping();
+}
+
+function removeShop(shopId) {
+  const shop = state.shops.find(s => s.id === shopId);
+  if (!shop || !confirm(`„${shop.name}“ aus deinen Märkten entfernen?\n\nEinträge dieses Markts stehen danach unter „Ohne Markt“.`)) return;
+  state.shops = state.shops.filter(s => s.id !== shopId);
+  for (const i of state.shopping) if (i.shopId === shopId) i.shopId = null;
+  for (const [key, id] of Object.entries(state.shopAssignments)) if (id === shopId) delete state.shopAssignments[key];
+  saveState();
+  renderPicker();
+  renderShopping();
+}
+
+function bindShopPickerEvents() {
+  $('#pickerClose').addEventListener('click', () => shopDialog.close());
+  shopDialog.addEventListener('click', ev => { if (ev.target === shopDialog) shopDialog.close(); });
+
+  $('#pickerShops').addEventListener('click', ev => {
+    const remove = ev.target.closest('[data-remove-shop]');
+    if (remove) return removeShop(remove.dataset.removeShop);
+    const pick = ev.target.closest('[data-pick-shop]');
+    if (pick) assignShop(pick.dataset.pickShop);
+  });
+
+  $('#pickerNearby').addEventListener('click', ev => {
+    const btn = ev.target.closest('[data-nearby]');
+    const result = btn && nearby?.results[Number(btn.dataset.nearby)];
+    if (!result) return;
+    let shop = state.shops.find(s => s.osm === result.osm);
+    if (!shop) {
+      shop = { id: uid(), name: result.name, detail: [result.type, result.street].filter(Boolean).join(' · '), osm: result.osm };
+      state.shops.push(shop);
+    }
+    assignShop(shop.id);
+  });
+
+  $('#pickerType').addEventListener('change', renderNearbyList);
+
+  $('#pickerAddressForm').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const text = $('#pickerAddress').value.trim();
+    if (!text) return setPickerStatus('Bitte eine Adresse oder Postleitzahl eingeben.', true);
+    $('#pickerAddressBtn').disabled = true;
+    setPickerStatus('Suche Adresse …');
+    try {
+      const location = await geocodeAddress(text);
+      if (!location) {
+        setPickerStatus('Die Adresse wurde nicht gefunden. Probiere es z. B. mit Straße und Ort oder nur mit der Postleitzahl.', true);
+        $('#pickerAddressBtn').disabled = false;
+        return;
+      }
+      state.shopLocation = location;
+      saveState();
+      $('#pickerAddress').value = location.label;
+      await wait(NOMINATIM_GAP_MS);
+      await runNearbySearch(location);
+    } catch (e) {
+      setPickerStatus(e.message, true);
+      $('#pickerAddressBtn').disabled = false;
+    }
+  });
+
+  $('#pickerGps').addEventListener('click', async () => {
+    $('#pickerGps').disabled = true;
+    setPickerStatus('Bestimme deinen Standort …');
+    try {
+      const position = await currentPosition();
+      await runNearbySearch({ ...position, label: 'deinen aktuellen Standort' });
+    } catch (e) {
+      setPickerStatus(e.message, true);
+      $('#pickerGps').disabled = false;
+    }
+  });
+
+  $('#pickerOwnForm').addEventListener('submit', ev => {
+    ev.preventDefault();
+    const name = $('#pickerOwnName').value.trim().replace(/\s+/g, ' ');
+    if (!name) return;
+    let shop = state.shops.find(s => !s.osm && s.name.toLowerCase() === name.toLowerCase());
+    if (!shop) {
+      shop = { id: uid(), name, detail: '', osm: '' };
+      state.shops.push(shop);
+    }
+    assignShop(shop.id);
+  });
+}
+
+function bindShoppingEvents() {
+  $('#shopForm').addEventListener('submit', ev => {
+    ev.preventDefault();
+    const input = $('#shopInput');
+    const name = input.value.trim().replace(/\s+/g, ' ');
+    if (!name) return;
+    // Von Hand bleibt der Text so, wie er eingegeben wurde („2 Eier“, „500 g Hackfleisch“)
+    if (addShoppingItem({ name }) === 'merged') showToast(`„${name}“ steht schon auf der Liste.`);
+    input.value = '';
+    saveState();
+    renderShopping();
+    input.focus();
+  });
+
+  $('#shopList').addEventListener('change', ev => {
+    if (!ev.target.matches('[data-shop-check]')) return;
+    const item = state.shopping.find(i => i.id === ev.target.closest('.shop-item').dataset.id);
+    if (!item) return;
+    item.checked = ev.target.checked;
+    saveState();
+    renderShopping();
+  });
+
+  $('#shopList').addEventListener('click', ev => {
+    if (ev.target.closest('[data-shop-pick]')) {
+      const item = state.shopping.find(i => i.id === ev.target.closest('.shop-item').dataset.id);
+      if (item) openShopPicker(item);
+      return;
+    }
+    if (!ev.target.closest('[data-shop-del]')) return;
+    const id = ev.target.closest('.shop-item').dataset.id;
+    state.shopping = state.shopping.filter(i => i.id !== id);
+    saveState();
+    renderShopping();
+  });
+
+  $('#shopClearDone').addEventListener('click', () => {
+    state.shopping = state.shopping.filter(i => !i.checked);
+    saveState();
+    renderShopping();
+  });
+
+  $('#shopClearAll').addEventListener('click', () => {
+    if (!confirm('Die ganze Einkaufsliste leeren?')) return;
+    state.shopping = [];
+    saveState();
+    renderShopping();
+  });
+
+  // Handy: Teilen-Menü (WhatsApp, Notizen …); PC: in die Zwischenablage kopieren
+  $('#shopShare').addEventListener('click', async () => {
+    const text = shoppingText();
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: 'Einkaufsliste', text });
+        return;
+      } catch (e) {
+        if (e.name === 'AbortError') return;
+      }
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast('Einkaufsliste in die Zwischenablage kopiert');
+    } catch {
+      showToast('Teilen ist in diesem Browser nicht möglich.', true);
+    }
   });
 }
 
@@ -1410,6 +3408,12 @@ function init() {
   bindSportEvents();
   bindDialogEvents();
   bindRecipeEvents();
+  bindImportEvents();
+  bindAiEvents();
+  bindShoppingEvents();
+  bindShopPickerEvents();
+  bindPantryEvents();
+  bindDislikeEvents();
   bindGoalEvents();
   bindDataEvents();
 
