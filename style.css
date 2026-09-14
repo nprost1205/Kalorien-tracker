@@ -372,6 +372,22 @@ input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px s
 .ai-swap { border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border)); }
 .ai-swap .status:empty { display: none; }
 #recipeNote .btn.small { margin-left: 6px; vertical-align: middle; }
+.recipe-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.recipe-tools input[type="search"] { flex: 1 1 200px; }
+.recipe-tools select { width: auto; flex: 0 1 auto; }
+.recipe-table { font-size: 14px; }
+.recipe-table th, .recipe-table td { white-space: nowrap; }
+.recipe-table td:first-child { white-space: normal; min-width: 120px; width: 100%; }
+.recipe-table tbody tr { cursor: pointer; }
+.recipe-table tbody tr:hover, .recipe-table tbody tr:focus-visible { background: var(--hover); outline: none; }
+.rt-name { display: block; font-weight: 600; color: var(--text); }
+.rt-sub { display: block; font-size: 12px; color: var(--muted); }
+.recipe-count { font-size: 13px; color: var(--muted); }
+@media (max-width: 560px) {
+  .recipe-tools select { flex: 1 1 140px; }
+  .recipe-table { font-size: 13px; }
+  .recipe-table th, .recipe-table td { padding: 6px 5px; }
+}
 .recipe-tag.dislike { background: color-mix(in srgb, var(--danger) 12%, var(--card)); color: var(--danger); }
 .recipe-tags { display: flex; flex-wrap: wrap; gap: 4px; margin: 3px 0; }
 .recipe-tag {

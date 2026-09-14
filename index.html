@@ -161,6 +161,19 @@
             <button type="button" id="newRecipeBtn" class="btn primary small">+ Neues Rezept</button>
           </div>
         </div>
+        <div id="recipeTools" class="recipe-tools" hidden>
+          <input type="search" id="recipeSearch" placeholder="Rezept oder Zutat suchen …" autocomplete="off" aria-label="Rezepte durchsuchen">
+          <select id="recipeSort" aria-label="Sortierung">
+            <option value="name">Name A–Z</option>
+            <option value="kcal-asc">Kalorien: wenig zuerst</option>
+            <option value="kcal-desc">Kalorien: viel zuerst</option>
+            <option value="protein-desc">Eiweiß: viel zuerst</option>
+            <option value="carbs-desc">Kohlenhydrate: viel zuerst</option>
+          </select>
+          <div class="seg" id="recipeViewSeg" role="group" aria-label="Ansicht">
+            <button type="button" data-recipe-view="cards">Karten</button>
+            <button type="button" data-recipe-view="table">Übersicht</button>
+          </div>        </div>
         <div id="recipeTagFilter" class="recipe-filter" role="group" aria-label="Rezepte filtern" hidden></div>
         <div id="recipeItems"></div>
       </div>
@@ -364,9 +377,7 @@
           <button type="button" class="btn small" id="cookLess" aria-label="Weniger Portionen">−</button>
           <span id="cookPortions"></span>
           <button type="button" class="btn small" id="cookMore" aria-label="Mehr Portionen">+</button>
-        </div>
-        <label class="check" id="cookAwakeLabel" hidden><input type="checkbox" id="cookAwake" checked> Bildschirm anlassen</label>
-      </div>
+        </div>      </div>
 
       <div id="cookTimers" class="cook-timers" hidden></div>
 
@@ -382,6 +393,7 @@
 
       <div class="form-actions cook-actions">
         <a id="cookVideo" class="btn" target="_blank" rel="noopener noreferrer" hidden>▶ Video ansehen</a>
+        <button type="button" id="cookShare" class="btn">📤 Teilen</button>
         <button type="button" id="cookLog" class="btn primary">Gegessen? Eintragen</button>
       </div>
     </div>
