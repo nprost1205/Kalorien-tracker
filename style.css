@@ -252,6 +252,8 @@ input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px s
 .sport-form input[name="name"] { flex: 1 1 180px; }
 .sport-form input[name="kcal"] { flex: 0 0 100px; }
 .kcal-rest .sport-info { color: var(--accent); }
+.fueling { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; padding-top: 12px; border-top: 1px solid var(--border); }
+.fueling .meal-head h3 { flex: 1; }
 .entry.warn .entry-name::before { content: "⚠ "; color: var(--c-carbs); }
 .ing-edit {
   display: flex;

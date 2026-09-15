@@ -21,6 +21,7 @@ const MEALS = [
   { key: 'mittag',      label: 'Mittagessen' },
   { key: 'abend',       label: 'Abendessen' },
   { key: 'snack',       label: 'Snacks' },
+  { key: 'fueling',     label: 'Fueling' }, // Ernährung während dem Sport, wird in der Sport-Karte angezeigt
 ];
 
 const DEFAULT_GOALS = { kcal: 2000, protein: 100, carbs: 250, fat: 70, fiber: 30 };
@@ -596,7 +597,7 @@ function renderSummary(t) {
 }
 
 function renderMeals(entries) {
-  $('#meals').innerHTML = MEALS.map(meal => {
+  $('#meals').innerHTML = MEALS.filter(meal => meal.key !== 'fueling').map(meal => {
     const items = entries.filter(e => e.meal === meal.key);
     const kcal = sumEntries(items).kcal;
     return `
@@ -640,6 +641,7 @@ function itemRow(e, prefix = '') {
 
 function renderSport() {
   const acts = state.activities[currentDate] || [];
+  const fueling = (state.diary[currentDate] || []).filter(e => e.meal === 'fueling');
   const burned = burnedKcal(currentDate);
   // Zuletzt verwendete kcal je Aktivitätsname, für Vorschläge beim Tippen
   const known = sportSuggestions();
@@ -663,7 +665,24 @@ function renderSport() {
       <input type="number" name="kcal" min="1" step="1" placeholder="kcal" aria-label="Verbrannte Kalorien" inputmode="numeric">
       <button type="submit" class="btn small primary">Eintragen</button>
     </form>
-    <datalist id="sportNames">${[...known.keys()].map(name => `<option value="${esc(name)}">`).join('')}</datalist>`;
+    <datalist id="sportNames">${[...known.keys()].map(name => `<option value="${esc(name)}">`).join('')}</datalist>
+    ${acts.length || fueling.length ? renderFueling(fueling) : ''}`;
+}
+
+/** Fueling = Essen/Trinken während dem Sport; normale Tagebucheinträge mit meal 'fueling'. */
+function renderFueling(items) {
+  const t = sumEntries(items);
+  return `
+    <div class="fueling">
+      <div class="meal-head">
+        <h3>Fueling</h3>
+        ${items.length ? `<span class="meal-kcal">${fmt(t.kcal)} kcal · ${fmt(t.carbs)} g K</span>` : ''}
+        <button type="button" class="btn small" data-add="fueling">+ Hinzufügen</button>
+      </div>
+      ${items.length
+        ? `<ul class="entries">${items.map(e => itemRow(e)).join('')}</ul>`
+        : '<p class="hint">Trag hier ein, was du während dem Sport isst und trinkst, z. B. Gels, Riegel oder Iso-Getränke. Es zählt zu deinen Tageswerten.</p>'}
+    </div>`;
 }
 
 /** Map Aktivitätsname → zuletzt eingetragene kcal (neueste Tage zuerst). */
@@ -739,32 +758,35 @@ function bindDayEvents() {
   $('#nextDay').addEventListener('click', () => { currentDate = addDays(currentDate, 1); renderDay(); });
   $('#todayBtn').addEventListener('click', () => { currentDate = today(); renderDay(); });
 
-  $('#meals').addEventListener('click', ev => {
-    const addBtn = ev.target.closest('[data-add]');
-    if (addBtn) return openAdd(addBtn.dataset.add);
-    if (ev.target.closest('[data-del]')) {
+  // Mahlzeiten und das Fueling in der Sport-Karte teilen sich die Eintrags-Logik
+  for (const container of [$('#meals'), $('#sport')]) {
+    container.addEventListener('click', ev => {
+      const addBtn = ev.target.closest('[data-add]');
+      if (addBtn) return openAdd(addBtn.dataset.add);
+      if (ev.target.closest('[data-del]')) {
+        const found = findEntry(ev.target);
+        if (!found || found.index < 0) return;
+        found.entries.splice(found.index, 1);
+        if (!found.entries.length) delete state.diary[currentDate];
+        saveState();
+        renderDay();
+      }
+    });
+
+    container.addEventListener('change', ev => {
+      if (!ev.target.matches('[data-grams]')) return;
       const found = findEntry(ev.target);
       if (!found || found.index < 0) return;
-      found.entries.splice(found.index, 1);
-      if (!found.entries.length) delete state.diary[currentDate];
-      saveState();
+      const grams = toNum(ev.target.value);
+      if (grams !== null && grams > 0) {
+        found.entries[found.index].grams = grams;
+        saveState();
+      } else {
+        showToast('Die Menge muss größer als 0 sein. Zum Entfernen ✕ benutzen.', true);
+      }
       renderDay();
-    }
-  });
-
-  $('#meals').addEventListener('change', ev => {
-    if (!ev.target.matches('[data-grams]')) return;
-    const found = findEntry(ev.target);
-    if (!found || found.index < 0) return;
-    const grams = toNum(ev.target.value);
-    if (grams !== null && grams > 0) {
-      found.entries[found.index].grams = grams;
-      saveState();
-    } else {
-      showToast('Die Menge muss größer als 0 sein. Zum Entfernen ✕ benutzen.', true);
-    }
-    renderDay();
-  });
+    });
+  }
 }
 
 // =====================================================================
