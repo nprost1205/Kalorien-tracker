@@ -373,6 +373,24 @@ input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px s
 .recipe-filter .tag-chip { font-size: 13px; padding: 4px 10px; }
 .ai-swap { border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border)); }
 .ai-swap .status:empty { display: none; }
+
+/* KI-Chat im Rezept-Editor */
+.ai-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-radius: 10px;
+}
+.ai-chat .status:empty { display: none; }
+.chat-log { display: flex; flex-direction: column; gap: 8px; }
+.chat-log:empty { display: none; }
+.chat-msg { max-width: 92%; padding: 8px 12px; border-radius: 12px; font-size: 14px; }
+.chat-msg p { margin: 0; overflow-wrap: anywhere; }
+.chat-user { align-self: flex-end; background: var(--accent); color: var(--accent-text); border-bottom-right-radius: 4px; }
+.chat-ai { align-self: flex-start; background: var(--hover); border-bottom-left-radius: 4px; }
+.chat-ai .btn { margin-top: 8px; }
 #recipeNote .btn.small { margin-left: 6px; vertical-align: middle; }
 .recipe-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .recipe-tools input[type="search"] { flex: 1 1 200px; }

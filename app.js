@@ -1490,6 +1490,8 @@ function startRecipeEdit(recipe, { importInfo = null, fromAi = false } = {}) {
   swap?.abort?.abort();
   swap = null;
   swapResult = null;
+  aiChat?.abort?.abort();
+  aiChat = newAiChat();
   recipeDraft = recipe
     ? structuredClone(recipe)
     : { id: `rec-${uid()}`, name: '', servings: 1, totalWeight: null, ingredients: [], instructions: '', sourceUrl: '', tags: [], updated: 0 };
@@ -1514,6 +1516,8 @@ function closeRecipeEditor({ saved = false } = {}) {
   swap?.abort?.abort();
   swap = null;
   swapResult = null;
+  aiChat?.abort?.abort();
+  aiChat = null;
   recipeDraft = null;
   draftImport = null;
   draftFromAi = false;
@@ -1530,6 +1534,7 @@ function renderRecipeEditor() {
   $('#recipeUrl').value = recipeDraft.sourceUrl ?? '';
   setMsg($('#recipeMsg'), '');
   renderDraft();
+  renderAiChat();
 }
 
 function renderDraft() {
@@ -2606,6 +2611,205 @@ function parseAiRecipe(text, servings) {
     sourceUrl: '',
     updated: 0,
   };
+}
+
+// ---------- Chat: ganzes Rezept im Editor mit der KI anpassen ----------
+
+const AI_CHAT_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    name: { type: 'STRING' },
+    portionen: { type: 'NUMBER' },
+    zutaten: AI_SCHEMA.properties.zutaten,
+    zubereitung: { type: 'ARRAY', items: { type: 'STRING' } },
+    antwort: { type: 'STRING' },
+  },
+  required: ['name', 'portionen', 'zutaten', 'zubereitung', 'antwort'],
+  propertyOrdering: ['name', 'portionen', 'zutaten', 'zubereitung', 'antwort'],
+};
+
+const AI_CHAT_PROMPT = `Du bist Koch und Ernährungsberater. Der Nutzer schreibt dir auf Deutsch, was er an seinem Rezept ändern möchte, und du gibst das angepasste Rezept zurück.
+
+Regeln:
+- Gib IMMER das VOLLSTÄNDIGE Rezept zurück, auch die Zutaten und Schritte, die gleich bleiben.
+- Ändere nur, worum der Nutzer bittet, und was dadurch nötig wird (z. B. Garzeit oder Mengen).
+- Übernimm bei unveränderten Zutaten Menge und Nährwerte genau so, wie sie im Rezept stehen.
+- Ist der Wunsch nur eine Frage, lass das Rezept unverändert und antworte in "antwort".
+
+Antworte im vorgegebenen JSON-Schema:
+- "name": Rezeptname, nur ändern, wenn er nicht mehr passt.
+- "portionen": Portionen des Rezepts, nur ändern, wenn der Nutzer es wünscht.
+- "zutaten": alle Zutaten für ALLE Portionen zusammen, auch Öl, Butter und Gewürze.
+  - "menge_g": Gramm im abgewogenen Zustand (Nudeln, Reis, Hülsenfrüchte roh bzw. trocken; Fleisch und Fisch roh; Flüssigkeiten 1 ml = 1 g).
+  - Nährwerte pro 100 g der Zutat in genau diesem Zustand, realistische Durchschnittswerte. Kohlenhydrate ohne Ballaststoffe. kcal ≈ 4 × Eiweiß + 4 × Kohlenhydrate + 9 × Fett + 2 × Ballaststoffe.
+- "zubereitung": die vollständigen Arbeitsschritte ohne Nummerierung.
+- "antwort": ein bis zwei kurze Sätze an den Nutzer, was du geändert hast oder was du ihm antwortest.`;
+
+const AI_CHAT_MAX_TURNS = 6; // ältere Nachrichten werden nicht mitgeschickt; das Rezept selbst geht immer komplett mit
+let aiChat = null; // { messages: [{ role: 'user'|'ai', text, undo }], abort, status, isError }
+
+function newAiChat() {
+  return { messages: [], abort: null, status: '', isError: false };
+}
+
+/** Das aktuelle Rezept als Text für die KI, mit Nährwerten, damit sie unveränderte Zutaten übernehmen kann. */
+function recipeForAi(r) {
+  const nut = p => (p.kcal === null
+    ? 'Nährwerte unbekannt'
+    : NUTRIENTS.map(n => (n.key === 'kcal'
+      ? fmtNut('kcal', p.kcal)
+      : `${fmtNut(n.key, p[n.key] ?? 0)} ${n.label}`)).join(', '));
+  const steps = instructionSteps(r.instructions);
+  return [
+    `Name: ${r.name || 'ohne Namen'}`,
+    `Portionen: ${r.servings}`,
+    'Zutaten (Menge für alle Portionen, in Klammern die Nährwerte pro 100 g):',
+    ...(r.ingredients.length ? r.ingredients.map(i => `- ${fmt(i.grams, 1)} g ${i.name} (${nut(i.per100)})`) : ['- (noch keine)']),
+    'Zubereitung:',
+    ...(steps.length ? steps.map(s => `- ${s}`) : ['- (noch keine)']),
+  ].join('\n');
+}
+
+function buildChatPrompt(recipe, wish) {
+  const lines = [`Mein Rezept:\n${recipeForAi(recipe)}`, '', `Mein Wunsch: ${wish}`];
+  const rules = recipe.tags
+    .filter(key => !(key === 'vegetarian' && recipe.tags.includes('vegan')))
+    .map(key => `- ${TAG[key].prompt}`);
+  if (rules.length) lines.push(`Das Rezept muss weiterhin diese Anforderungen erfüllen:\n${rules.join('\n')}`);
+  if (state.dislikes.length) lines.push(`Verwende auf keinen Fall: ${state.dislikes.map(d => d.name).join(', ')}`);
+  return lines.join('\n');
+}
+
+/**
+ * Zutaten aus der KI-Antwort. Nährwerte, die der Nutzer geprüft oder aus der Produktsuche
+ * übernommen hat (Marke ≠ „KI-Schätzung“), bleiben bei gleichem Namen erhalten.
+ */
+function mergeChatIngredients(list, previous) {
+  const known = new Map();
+  for (const i of previous) known.set(nameKey(i.name), i);
+  return parseAiIngredients(list).map(i => {
+    const old = known.get(nameKey(i.name));
+    if (!old) return i;
+    known.delete(nameKey(i.name)); // jede alte Zutat nur einmal übernehmen
+    // Die Kennung bleibt gleich, damit unveränderte Zutaten nicht als Änderung zählen
+    const keepValues = old.per100.kcal !== null && old.brand !== AI_BRAND;
+    return keepValues
+      ? { ...i, id: old.id, brand: old.brand, code: old.code, per100: { ...old.per100 } }
+      : { ...i, id: old.id };
+  });
+}
+
+function renderAiChat() {
+  const hasKey = Boolean(readLocal(AI_KEY_STORAGE));
+  const busy = Boolean(aiChat?.abort);
+  const messages = aiChat?.messages || [];
+  $('#aiChatHint').hidden = hasKey && messages.length > 0;
+  $('#aiChatHint').textContent = hasKey
+    ? 'Schreib der KI, was sie ändern soll, zum Beispiel „ohne Sahne“, „schärfer“, „mehr Eiweiß“ oder „für 4 Portionen“. Sie ändert dann Zutaten und Zubereitung hier im Rezept.'
+    : 'Dafür brauchst du die KI. Richte sie einmal ein: Rezept schließen, dann in der Rezeptliste auf „✨ Mit KI“ tippen.';
+  $('#aiChatInput').disabled = !hasKey || busy;
+  $('#aiChatSend').disabled = !hasKey || busy;
+  $('#aiChatSend').textContent = busy ? 'Läuft …' : 'Senden';
+  $('#aiChatReset').hidden = !messages.length || busy;
+
+  const last = messages.length - 1;
+  $('#aiChatLog').innerHTML = messages.map((m, index) => `
+    <div class="chat-msg ${m.role === 'user' ? 'chat-user' : 'chat-ai'}">
+      <p>${m.role === 'ai' ? '✨ ' : ''}${esc(m.text)}</p>
+      ${m.undo && index === last ? '<button type="button" class="btn small" data-chat-undo>↩ Rückgängig</button>' : ''}
+    </div>`).join('');
+  const status = $('#aiChatStatus');
+  status.textContent = aiChat?.status || '';
+  status.classList.toggle('error', Boolean(aiChat?.isError));
+}
+
+async function sendAiChat() {
+  const key = readLocal(AI_KEY_STORAGE);
+  if (!recipeDraft || !key || aiChat?.abort) return;
+  const wish = $('#aiChatInput').value.trim();
+  if (!wish) return $('#aiChatInput').focus();
+  if (!aiChat) aiChat = newAiChat();
+  const current = aiChat;
+  const history = current.messages.slice(-AI_CHAT_MAX_TURNS).map(m => ({
+    role: m.role === 'user' ? 'user' : 'model',
+    parts: [{ text: m.text }],
+  }));
+  current.messages.push({ role: 'user', text: wish });
+  current.abort = new AbortController();
+  current.isError = false;
+  $('#aiChatInput').value = '';
+  const started = Date.now();
+  const statusText = () => `Die KI passt dein Rezept an … ${Math.round((Date.now() - started) / 1000)} s`;
+  current.status = statusText();
+  renderAiChat();
+  const timer = setInterval(() => {
+    current.status = statusText();
+    $('#aiChatStatus').textContent = current.status;
+  }, 1000);
+  const before = structuredClone(recipeDraft);
+
+  try {
+    const model = await currentAiModel(key);
+    const data = await geminiFetch(`models/${model}:generateContent`, {
+      key,
+      signal: current.abort.signal,
+      body: {
+        systemInstruction: { parts: [{ text: AI_CHAT_PROMPT }] },
+        contents: [...history, { role: 'user', parts: [{ text: buildChatPrompt(recipeDraft, wish) }] }],
+        generationConfig: { responseMimeType: 'application/json', responseSchema: AI_CHAT_SCHEMA },
+      },
+    });
+    const answer = parseAiJson(geminiText(data));
+    if (aiChat !== current || !recipeDraft) return; // Editor wurde inzwischen geschlossen oder gewechselt
+    const ingredients = mergeChatIngredients(answer?.zutaten, before.ingredients);
+    if (!ingredients.length) throw new AiError('Die KI hat keine verwertbaren Zutaten geliefert. Bitte nochmal versuchen.');
+    const servings = toNum(answer?.portionen);
+    const steps = instructionSteps((Array.isArray(answer?.zubereitung) ? answer.zubereitung.map(String) : []).join('\n'));
+    const name = String(answer?.name ?? '').trim();
+
+    recipeDraft.ingredients = ingredients;
+    if (steps.length) recipeDraft.instructions = steps.join('\n');
+    if (name) recipeDraft.name = name;
+    if (servings !== null && servings > 0 && servings <= 20) recipeDraft.servings = round(servings, 2);
+    const text = String(answer?.antwort ?? '').trim() || 'Rezept angepasst.';
+    const changed = JSON.stringify(before) !== JSON.stringify(recipeDraft);
+    current.messages.push({ role: 'ai', text, undo: changed ? before : null });
+    current.status = '';
+    current.abort = null;
+    renderRecipeEditor(); // Name, Portionen und Zubereitung stehen in eigenen Feldern
+  } catch (e) {
+    if (aiChat !== current) return;
+    current.status = e.aborted ? '' : e.message;
+    current.isError = !e.aborted;
+    current.abort = null;
+    if (e.badModel) writeLocal(AI_MODEL_STORAGE, '');
+    renderAiChat();
+  } finally {
+    clearInterval(timer);
+    if (aiChat === current) current.abort = null;
+  }
+}
+
+function bindAiChatEvents() {
+  $('#aiChatSend').addEventListener('click', sendAiChat);
+  $('#aiChatInput').addEventListener('keydown', ev => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault(); // nicht das Rezept speichern
+    sendAiChat();
+  });
+  $('#aiChatReset').addEventListener('click', () => {
+    aiChat = newAiChat();
+    renderAiChat();
+  });
+  $('#aiChatLog').addEventListener('click', ev => {
+    if (!ev.target.closest('[data-chat-undo]')) return;
+    const message = aiChat?.messages[aiChat.messages.length - 1];
+    if (!message?.undo) return;
+    recipeDraft = message.undo;
+    message.undo = null;
+    message.text = `${message.text} (rückgängig gemacht)`;
+    renderRecipeEditor();
+  });
 }
 
 function renderAiCard() {
@@ -3763,6 +3967,7 @@ function init() {
   bindRecipeEvents();
   bindImportEvents();
   bindAiEvents();
+  bindAiChatEvents();
   bindShoppingEvents();
   bindShopPickerEvents();
   bindPantryEvents();

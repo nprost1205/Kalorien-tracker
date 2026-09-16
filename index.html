@@ -191,6 +191,20 @@
       <form id="recipeEditor" class="card" novalidate hidden>
         <h2 id="recipeEditorTitle">Neues Rezept</h2>
         <div id="recipeNote" class="note" hidden></div>
+
+        <div id="aiChatCard" class="ai-chat">
+          <div class="card-head">
+            <h3>✨ Mit der KI anpassen</h3>
+            <button type="button" id="aiChatReset" class="btn small" hidden>Verlauf löschen</button>
+          </div>
+          <p id="aiChatHint" class="hint">Schreib der KI, was sie ändern soll, zum Beispiel „ohne Sahne“, „schärfer“, „mehr Eiweiß“ oder „für 4 Portionen“. Sie ändert dann Zutaten und Zubereitung hier im Rezept.</p>
+          <div id="aiChatLog" class="chat-log" aria-live="polite"></div>
+          <div class="search-row">
+            <input type="text" id="aiChatInput" placeholder="z. B. mach es schärfer" autocomplete="off" enterkeyhint="send" aria-label="Was soll die KI ändern?">
+            <button type="button" id="aiChatSend" class="btn primary">Senden</button>
+          </div>
+          <p id="aiChatStatus" class="status"></p>
+        </div>
         <div class="form-grid">
           <label class="field wide">Name <input type="text" id="recipeName" autocomplete="off"></label>
           <label class="field">Portionen <input type="number" id="recipeServings" min="0" step="any" inputmode="decimal"></label>
