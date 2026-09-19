@@ -417,6 +417,7 @@ function loadState() {
 function saveState() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    scheduleSync(); // Cloud-Sync, falls eingerichtet
     return true;
   } catch (e) {
     showToast(`Speichern fehlgeschlagen: ${e.message}`, true);
@@ -3849,7 +3850,8 @@ function bindGoalEvents() {
 // =====================================================================
 
 function renderData() {
-  const foods = Object.values(state.foods).sort((a, b) => a.name.localeCompare(b.name, 'de'));
+  renderSync();
+  const foods =Object.values(state.foods).sort((a, b) => a.name.localeCompare(b.name, 'de'));
   const dayCount = Object.keys(state.diary).length;
   const entryCount = Object.values(state.diary).reduce((sum, list) => sum + list.length, 0);
   const recipeCount = Object.keys(state.recipes).length;
@@ -3908,7 +3910,7 @@ function bindDataEvents() {
     try {
       const imported = normalizeState(JSON.parse(await file.text()));
       const days = Object.keys(imported.diary).length;
-      if (!confirm(`Backup mit ${days} Tagen laden?\n\nDeine aktuellen Daten werden dabei vollständig ersetzt.`)) return;
+      if (!confirm(`Backup mit ${days} Tagen laden?\n\nDeine aktuellen Daten werden dabei vollständig ersetzt.${syncWarning()}`)) return;
       state = imported;
       recipeDraft = null;
       if (saveState()) setMsg($('#dataMsg'), `Backup importiert (${days} Tage).`);
@@ -3928,13 +3930,387 @@ function bindDataEvents() {
   });
 
   $('#resetBtn').addEventListener('click', () => {
-    if (!confirm('Wirklich ALLE Einträge, Produkte und Ziele löschen?\n\nDas kann nicht rückgängig gemacht werden. Exportiere vorher ein Backup, falls du die Daten noch brauchst.')) return;
+    if (!confirm(`Wirklich ALLE Einträge, Produkte und Ziele löschen?\n\nDas kann nicht rückgängig gemacht werden. Exportiere vorher ein Backup, falls du die Daten noch brauchst.${syncWarning()}`)) return;
     state = defaultState();
     recipeDraft = null;
     currentDate = today();
     if (saveState()) setMsg($('#dataMsg'), 'Alle Daten wurden gelöscht.');
     renderData();
   });
+}
+
+// =====================================================================
+// Cloud-Sync (privates GitHub-Repository des Nutzers)
+// =====================================================================
+
+// Zugang und Abgleich-Stand bewusst außerhalb von `state`: kommen nicht ins Backup
+const SYNC_TOKEN_STORAGE = 'kalorienTracker.syncToken';
+const SYNC_REPO_STORAGE = 'kalorienTracker.syncRepo'; // „besitzer/repository“
+const SYNC_BASE_STORAGE = 'kalorienTracker.syncBase'; // Stand beim letzten Abgleich, Grundlage fürs Zusammenführen
+const SYNC_TIME_STORAGE = 'kalorienTracker.syncTime';
+const SYNC_FILE = 'kalorien-tracker-daten.json';
+const GITHUB_API = 'https://api.github.com';
+const SYNC_DELAY_MS = 4000; // nach einer Änderung kurz warten, damit mehrere Änderungen gemeinsam hochgehen
+const SYNC_POLL_MS = 120000; // solange die App offen ist, regelmäßig Änderungen der anderen Geräte holen
+const SYNC_TIMEOUT_MS = 20000;
+
+let syncTimer = null;
+let syncRunning = false;
+let syncAgain = false;
+let syncApplying = false; // true, während ein Abgleich den Zustand speichert (löst keinen neuen Abgleich aus)
+let syncStatus = { text: '', isError: false };
+let syncAuthWarned = false; // Schlüssel-Probleme nur einmal pro Sitzung als Meldung zeigen
+
+class SyncError extends Error {
+  constructor(message, { conflict = false, auth = false } = {}) {
+    super(message);
+    Object.assign(this, { conflict, auth });
+  }
+}
+
+function syncConfig() {
+  const token = readLocal(SYNC_TOKEN_STORAGE);
+  const repo = readLocal(SYNC_REPO_STORAGE);
+  return token && repo ? { token, repo } : null;
+}
+
+function githubError(status, { setup = false } = {}) {
+  if (status === 401) {
+    return new SyncError(setup
+      ? 'Der Schlüssel ist ungültig. Prüfe, ob du ihn vollständig kopiert hast.'
+      : 'Der GitHub-Schlüssel ist ungültig oder abgelaufen. Tippe auf „Trennen“ und trag einen neuen Schlüssel ein.', { auth: true });
+  }
+  if (status === 403) {
+    return new SyncError('GitHub verweigert den Zugriff. Prüfe, ob beim Schlüssel „Contents“ auf „Read and write“ steht.', { auth: true });
+  }
+  if (status === 404) {
+    return new SyncError('Das Repository wurde nicht gefunden. Prüfe den Namen und ob der Schlüssel Zugriff darauf hat („Only select repositories“).', { auth: true });
+  }
+  if (status === 409 || status === 422) return new SyncError('Die Daten wurden gleichzeitig auf einem anderen Gerät geändert.', { conflict: true });
+  if (status >= 500) return new SyncError('GitHub ist gerade gestört. Neuer Versuch beim nächsten Abgleich.');
+  return new SyncError(`GitHub meldet einen Fehler (${status}).`);
+}
+
+async function githubFetch(path, { token, method = 'GET', body = null }) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), SYNC_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${GITHUB_API}/${path}`, {
+      method,
+      cache: 'no-store', // sonst liefert der Browser bis zu 60 s alte Daten
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ctrl.signal,
+    });
+    let data = null;
+    try { data = await res.json(); } catch { /* leere Antwort */ }
+    return { status: res.status, ok: res.ok, data };
+  } catch {
+    throw new SyncError(ctrl.signal.aborted
+      ? 'GitHub antwortet gerade nicht. Neuer Versuch beim nächsten Abgleich.'
+      : navigator.onLine
+        ? 'GitHub ist nicht erreichbar. Neuer Versuch beim nächsten Abgleich.'
+        : 'Keine Internetverbindung. Deine Daten werden abgeglichen, sobald du wieder online bist.');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Base64 für UTF-8-Text (btoa/atob allein kennen nur Latin-1, Umlaute gingen kaputt). */
+function toBase64(text) {
+  const bytes = new TextEncoder().encode(text);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+function fromBase64(b64) {
+  const bin = atob(String(b64).replace(/\s/g, ''));
+  return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)));
+}
+
+/** Datei aus der Cloud: { sha, state } oder null, wenn es noch keine gibt. */
+async function syncDownload({ token, repo }) {
+  const res = await githubFetch(`repos/${repo}/contents/${SYNC_FILE}`, { token });
+  if (res.status === 404) return null;
+  if (!res.ok) throw githubError(res.status);
+  let content = res.data?.content;
+  if (!content && res.data?.size > 0) { // Dateien über 1 MB liefert die Contents-API ohne Inhalt
+    const blob = await githubFetch(`repos/${repo}/git/blobs/${res.data.sha}`, { token });
+    if (!blob.ok) throw githubError(blob.status);
+    content = blob.data?.content;
+  }
+  try {
+    return { sha: res.data.sha, state: normalizeState(JSON.parse(fromBase64(content || ''))) };
+  } catch {
+    throw new SyncError(`Die Daten in der Cloud sind nicht lesbar. Lösche im Repository die Datei „${SYNC_FILE}“, dann lädt die App deine Daten neu hoch.`);
+  }
+}
+
+async function syncUpload({ token, repo }, data, sha) {
+  const res = await githubFetch(`repos/${repo}/contents/${SYNC_FILE}`, {
+    token,
+    method: 'PUT',
+    body: {
+      message: `Abgleich ${new Date().toLocaleString('de-DE')}`,
+      content: toBase64(JSON.stringify(data)),
+      ...(sha ? { sha } : {}), // sha fehlt/veraltet → GitHub lehnt ab (Konflikt), statt fremde Änderungen zu überschreiben
+    },
+  });
+  if (!res.ok) throw githubError(res.status);
+}
+
+function loadSyncBase() {
+  try { return normalizeState(JSON.parse(readLocal(SYNC_BASE_STORAGE))); } catch { return null; }
+}
+
+/**
+ * Zustand als flache Liste einzelner Datensätze (Schlüssel → { kind, day, value }), damit der Abgleich
+ * pro Eintrag, Rezept, Produkt … entscheiden kann statt nur für alles auf einmal.
+ */
+function syncRecords(s) {
+  const recs = new Map();
+  const add = (key, kind, value, day = null) => recs.set(key, { kind, day, value });
+  add('goals', 'goals', s.goals);
+  add('shopLocation', 'shopLocation', s.shopLocation);
+  for (const kind of ['foods', 'recipes']) {
+    for (const [id, x] of Object.entries(s[kind])) add(`${kind}/${id}`, kind, x);
+  }
+  for (const kind of ['diary', 'activities']) {
+    for (const [day, list] of Object.entries(s[kind])) {
+      for (const x of list) add(`${kind}/${day}/${x.id}`, kind, x, day);
+    }
+  }
+  for (const kind of ['shopping', 'shops']) {
+    for (const x of s[kind]) add(`${kind}/${x.id}`, kind, x);
+  }
+  for (const [key, id] of Object.entries(s.shopAssignments)) add(`shopAssignments/${key}`, 'shopAssignments', { key, id });
+  // Vorrat und „Mag ich nicht“ nach Namen: zwei Geräte legen denselben Namen mit verschiedenen Kennungen an
+  for (const kind of ['pantry', 'dislikes']) {
+    for (const x of s[kind]) add(`${kind}/${x.name.toLowerCase()}`, kind, x);
+  }
+  return recs;
+}
+
+function stateFromRecords(recs) {
+  const s = defaultState();
+  for (const { kind, day, value } of recs.values()) {
+    if (kind === 'goals' || kind === 'shopLocation') s[kind] = value;
+    else if (kind === 'foods' || kind === 'recipes') s[kind][value.id] = value;
+    else if (kind === 'diary' || kind === 'activities') (s[kind][day] ||= []).push(value);
+    else if (kind === 'shopAssignments') s.shopAssignments[value.key] = value.id;
+    else s[kind].push(value);
+  }
+  return normalizeState(s);
+}
+
+const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+/** Auf beiden Geräten geändert: der neuere gewinnt (Rezepte: updated, Produkte: lastUsed), sonst der lokale. */
+function newerRecord(local, remote) {
+  const stamp = rec => toNum(rec.value?.updated ?? rec.value?.lastUsed);
+  const l = stamp(local);
+  const r = stamp(remote);
+  return l !== null && r !== null && r > l ? remote : local;
+}
+
+/**
+ * Dreiwege-Abgleich gegen den Stand beim letzten Abgleich (base):
+ * Neues von beiden Seiten kommt dazu, Gelöschtes bleibt gelöscht, Geändertes gewinnt gegen Unverändertes.
+ */
+function mergeStates(base, local, remote) {
+  const B = syncRecords(base);
+  const L = syncRecords(local);
+  const R = syncRecords(remote);
+  const out = new Map();
+  for (const [key, l] of L) {
+    const r = R.get(key);
+    const b = B.get(key);
+    if (!r) {
+      // fehlt in der Cloud: hier neu oder hier geändert → behalten; sonst wurde es woanders gelöscht
+      if (!b || !sameJson(b.value, l.value)) out.set(key, l);
+    } else if (sameJson(l.value, r.value) || (b && sameJson(b.value, r.value))) {
+      out.set(key, l);
+    } else if (b && sameJson(b.value, l.value)) {
+      out.set(key, r);
+    } else {
+      out.set(key, newerRecord(l, r));
+    }
+  }
+  for (const [key, r] of R) {
+    if (L.has(key)) continue;
+    const b = B.get(key);
+    if (!b || !sameJson(b.value, r.value)) out.set(key, r); // woanders neu; sonst hier gelöscht
+  }
+  return stateFromRecords(out);
+}
+
+function setSyncStatus(text, isError = false) {
+  syncStatus = { text, isError };
+  if (currentView === 'data') renderSync();
+}
+
+function scheduleSync(delay = SYNC_DELAY_MS) {
+  if (syncApplying || !syncConfig()) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => syncNow(), delay);
+}
+
+/** Ergebnis übernehmen, ohne Änderungen zu verlieren, die während des Abgleichs gemacht wurden. */
+function applySyncedState(snapshot, merged) {
+  const current = normalizeState(state);
+  const next = sameJson(current, snapshot) ? merged : mergeStates(snapshot, current, merged);
+  if (!sameJson(next, merged)) syncAgain = true; // neue Änderungen gleich hinterherschicken
+  if (sameJson(next, current)) return;
+  state = next;
+  syncApplying = true;
+  saveState();
+  syncApplying = false;
+  // Nicht neu zeichnen, während jemand gerade tippt; die Daten sind trotzdem da
+  const active = document.activeElement;
+  if (!active?.matches?.('input:not([type="checkbox"]), textarea, select')) RENDERERS[currentView]();
+}
+
+async function syncNow({ manual = false } = {}) {
+  clearTimeout(syncTimer);
+  syncTimer = null;
+  const cfg = syncConfig();
+  if (!cfg) return;
+  if (syncRunning) {
+    syncAgain = true;
+    return;
+  }
+  syncRunning = true;
+  setSyncStatus('Wird abgeglichen …');
+  try {
+    for (let attempt = 1; ; attempt++) {
+      const snapshot = normalizeState(state);
+      const remote = await syncDownload(cfg);
+      const merged = remote ? mergeStates(loadSyncBase() || defaultState(), snapshot, remote.state) : snapshot;
+      if (!remote || !sameJson(merged, remote.state)) {
+        try {
+          await syncUpload(cfg, merged, remote?.sha);
+        } catch (e) {
+          if (e.conflict && attempt < 3) continue; // anderes Gerät war schneller: neu laden und nochmal zusammenführen
+          throw e;
+        }
+      }
+      writeLocal(SYNC_BASE_STORAGE, JSON.stringify(merged));
+      applySyncedState(snapshot, merged);
+      break;
+    }
+    writeLocal(SYNC_TIME_STORAGE, String(Date.now()));
+    setSyncStatus('');
+    if (manual) showToast('Daten abgeglichen ✓');
+  } catch (e) {
+    setSyncStatus(e.message, true);
+    if (manual || (e.auth && !syncAuthWarned)) showToast(`Cloud-Sync: ${e.message}`, true);
+    if (e.auth) syncAuthWarned = true;
+  } finally {
+    syncRunning = false;
+    if (currentView === 'data') renderSync();
+    if (syncAgain) {
+      syncAgain = false;
+      scheduleSync(500);
+    }
+  }
+}
+
+function formatSyncTime(ms) {
+  const d = new Date(ms);
+  const time = d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+  return dateKey(d) === today() ? `heute, ${time}` : `${d.toLocaleDateString('de-DE')}, ${time}`;
+}
+
+function renderSync() {
+  const cfg = syncConfig();
+  $('#syncSetup').hidden = Boolean(cfg);
+  $('#syncActive').hidden = !cfg;
+  if (!cfg) return;
+  $('#syncRepoLabel').textContent = cfg.repo;
+  const time = toNum(readLocal(SYNC_TIME_STORAGE));
+  const status = $('#syncStatus');
+  status.textContent = syncStatus.text || (time ? `Zuletzt abgeglichen: ${formatSyncTime(time)}` : 'Noch nicht abgeglichen.');
+  status.classList.toggle('error', syncStatus.isError);
+  $('#syncNowBtn').disabled = syncRunning;
+}
+
+async function connectSync() {
+  const msg = $('#syncMsg');
+  const token = $('#syncTokenInput').value.trim().replace(/\s+/g, '');
+  // auch „https://github.com/name/repo“ oder „name/repo“ akzeptieren
+  const repoInput = $('#syncRepoInput').value.trim()
+    .replace(/^https?:\/\/(www\.)?github\.com\//i, '').replace(/\.git$/i, '').replace(/\/+$/, '');
+  if (!repoInput) return setMsg(msg, 'Bitte den Namen des Repositorys eingeben.', true);
+  if (!token) return setMsg(msg, 'Bitte zuerst den Schlüssel einfügen.', true);
+  $('#syncConnect').disabled = true;
+  setMsg(msg, 'Verbindung wird geprüft …');
+  try {
+    let fullName = repoInput;
+    if (!fullName.includes('/')) {
+      const user = await githubFetch('user', { token });
+      if (!user.ok) throw githubError(user.status, { setup: true });
+      fullName = `${user.data.login}/${repoInput}`;
+    }
+    const repo = await githubFetch(`repos/${fullName}`, { token });
+    if (!repo.ok) throw githubError(repo.status, { setup: true });
+    if (!repo.data?.private) {
+      throw new SyncError('Dieses Repository ist öffentlich, dort könnte jeder deine Daten lesen. Bitte ein privates Repository verwenden (Schritt 1).');
+    }
+    if (!writeLocal(SYNC_TOKEN_STORAGE, token) || !writeLocal(SYNC_REPO_STORAGE, repo.data.full_name || fullName)) {
+      throw new SyncError('Der Schlüssel konnte in diesem Browser nicht gespeichert werden.');
+    }
+    writeLocal(SYNC_BASE_STORAGE, ''); // neues Repository: nichts gilt als gelöscht, beide Seiten werden vereint
+    writeLocal(SYNC_TIME_STORAGE, '');
+    syncAuthWarned = false;
+    $('#syncTokenInput').value = '';
+    setMsg(msg, '');
+    renderSync();
+    await syncNow({ manual: true });
+  } catch (e) {
+    setMsg(msg, e.message, true);
+  } finally {
+    $('#syncConnect').disabled = false;
+  }
+}
+
+function disconnectSync() {
+  if (!confirm('Cloud-Sync auf diesem Gerät beenden?\n\nDeine Daten bleiben auf diesem Gerät und in der Cloud erhalten, werden aber nicht mehr abgeglichen.')) return;
+  clearTimeout(syncTimer);
+  syncTimer = null;
+  for (const key of [SYNC_TOKEN_STORAGE, SYNC_REPO_STORAGE, SYNC_BASE_STORAGE, SYNC_TIME_STORAGE]) writeLocal(key, '');
+  syncStatus = { text: '', isError: false };
+  renderSync();
+}
+
+/** Zusatz für Rückfragen, die alle Daten ersetzen: wirkt mit Sync auch auf die anderen Geräte. */
+function syncWarning() {
+  return syncConfig() ? '\n\nDer Cloud-Sync ist an: Das gilt auch für die Cloud und deine anderen Geräte.' : '';
+}
+
+function bindSyncEvents() {
+  $('#syncConnect').addEventListener('click', connectSync);
+  $('#syncTokenInput').addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') connectSync();
+  });
+  $('#syncNowBtn').addEventListener('click', () => syncNow({ manual: true }));
+  $('#syncDisconnect').addEventListener('click', disconnectSync);
+
+  // Zurück in der App (z. B. Handy entsperrt): Änderungen der anderen Geräte holen.
+  // Beim Verlassen noch ausstehende Änderungen sofort hochladen.
+  document.addEventListener('visibilitychange', () => {
+    if (!syncConfig()) return;
+    if (document.visibilityState === 'visible') syncNow();
+    else if (syncTimer) syncNow();
+  });
+  window.addEventListener('online', () => syncNow());
+  setInterval(() => {
+    if (document.visibilityState === 'visible' && !syncTimer) syncNow();
+  }, SYNC_POLL_MS);
 }
 
 // =====================================================================
@@ -3975,6 +4351,7 @@ function init() {
   bindCookEvents();
   bindGoalEvents();
   bindDataEvents();
+  bindSyncEvents();
 
   // Änderungen aus einem zweiten Browser-Tab übernehmen
   window.addEventListener('storage', ev => {
@@ -3988,6 +4365,7 @@ function init() {
     $('#storageBanner').hidden = false;
   }
   showView('day');
+  syncNow(); // Änderungen der anderen Geräte holen (nur, wenn der Cloud-Sync eingerichtet ist)
 
   // Installierbar/offline nur über http(s), z. B. GitHub Pages – unter file:// gibt es keinen Service Worker
   if (location.protocol.startsWith('http') && 'serviceWorker' in navigator) {

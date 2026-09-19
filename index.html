@@ -280,6 +280,46 @@
 
     <!-- Daten -->
     <section id="view-data" class="view" hidden>
+      <div class="card" id="syncCard">
+        <h2>☁️ Cloud-Sync</h2>
+        <div id="syncSetup" class="sync-setup">
+          <p class="muted">Damit Handy und PC dieselben Daten zeigen. Deine Daten liegen dann zusätzlich in einem privaten Speicher (Repository) in deinem GitHub-Konto, den nur du sehen kannst. Du richtest das einmal am PC und einmal am Handy ein.</p>
+          <details class="howto" open>
+            <summary>Einrichtung (ca. 5 Minuten)</summary>
+            <ol>
+              <li><b>Privaten Speicher anlegen:</b> <a href="https://github.com/new" target="_blank" rel="noopener noreferrer">github.com/new öffnen</a>. Bei „Repository name“ <b>kalorien-daten</b> eintragen, <b>„Private“</b> auswählen und auf <b>„Create repository“</b> klicken. (Nur einmal nötig, nicht noch mal am Handy.)</li>
+              <li><b>Schlüssel erstellen:</b> <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">Seite für neue Schlüssel öffnen</a> und dort:
+                <ul>
+                  <li>„Token name“: <b>Kalorien-Tracker</b></li>
+                  <li>„Expiration“: die längste Dauer wählen</li>
+                  <li>„Repository access“: <b>„Only select repositories“</b> und dort <b>kalorien-daten</b> auswählen</li>
+                  <li>„Permissions“ → „Repository permissions“: bei <b>„Contents“</b> auf <b>„Read and write“</b> stellen</li>
+                  <li>Unten auf <b>„Generate token“</b> klicken und den Schlüssel kopieren (er beginnt mit <code>github_pat_</code>)</li>
+                </ul>
+              </li>
+              <li>Schlüssel hier einfügen und auf <b>„Verbinden“</b> tippen.</li>
+              <li>Am Handy in der App ebenfalls Schritt 3 machen. Den Schlüssel kannst du dir dafür per Mail schicken, lösch die Mail danach wieder.</li>
+            </ol>
+          </details>
+          <div class="form-grid">
+            <label class="field">Repository <input type="text" id="syncRepoInput" value="kalorien-daten" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+            <label class="field wide">Schlüssel <input type="text" id="syncTokenInput" placeholder="github_pat_…" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+          </div>
+          <div class="form-actions">
+            <button type="button" id="syncConnect" class="btn primary">Verbinden</button>
+          </div>
+          <p id="syncMsg" class="msg" hidden></p>
+          <p class="hint">Der Schlüssel bleibt nur auf diesem Gerät und kommt nicht ins Backup. Er erlaubt nur den Zugriff auf dieses eine Repository.</p>
+        </div>
+        <div id="syncActive" class="sync-setup" hidden>
+          <p>Verbunden mit <b id="syncRepoLabel"></b>. Deine Änderungen werden automatisch abgeglichen, sobald du online bist.</p>
+          <p id="syncStatus" class="status"></p>
+          <div class="form-actions">
+            <button type="button" id="syncNowBtn" class="btn primary">Jetzt abgleichen</button>
+            <button type="button" id="syncDisconnect" class="btn">Trennen</button>
+          </div>
+        </div>
+      </div>
       <div class="card">
         <h2>Backup</h2>
         <p class="muted">Deine Daten liegen nur in diesem Browser auf deinem PC. Wenn du die Browserdaten löschst, ist alles weg. Exportiere deshalb regelmäßig ein Backup.</p>

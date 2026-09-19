@@ -374,6 +374,14 @@ input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px s
 .ai-swap { border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border)); }
 .ai-swap .status:empty { display: none; }
 
+/* Cloud-Sync */
+.sync-setup { display: flex; flex-direction: column; gap: 10px; }
+.sync-setup ol { margin: 8px 0 0; padding-left: 20px; }
+.sync-setup li { margin: 6px 0; }
+.sync-setup ul { margin: 4px 0; padding-left: 18px; }
+.sync-setup a { color: var(--accent); font-weight: 600; }
+.sync-setup .status:empty { display: none; }
+
 /* KI-Chat im Rezept-Editor */
 .ai-chat {
   display: flex;
